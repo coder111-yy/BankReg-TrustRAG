@@ -1,0 +1,17 @@
+.git
+.env
+.venv
+.pytest_cache
+__pycache__/
+**/__pycache__/
+*.py[cod]
+
+# 授权数据和本地运行产物不得进入镜像构建上下文。
+03-*/
+data/
+artifacts/
+BankReg-TrustRAG_project/
+_project_book_render*/
+dist/
+*.zip
+

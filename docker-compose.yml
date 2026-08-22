@@ -1,0 +1,13 @@
+services:
+  bankreg-trustrag:
+    build: .
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      BANKREG_DATA_DIR: /data
+      BANKREG_ARTIFACT_DIR: /app/artifacts
+      BANKREG_DB: /app/artifacts/bankreg.sqlite3
+    volumes:
+      - ./data:/data:ro
+      - ./artifacts:/app/artifacts
+      - ./frontend:/app/frontend:ro

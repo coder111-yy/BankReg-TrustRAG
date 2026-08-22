@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#10252d" />
+  <title>BankReg · 可信监管问答</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #10252d; --ink-soft: #2b4249; --muted: #6b7f83; --muted-light: #94a4a5;
+      --paper: #f3f0e8; --panel: rgba(255, 254, 249, .86); --white: #fffef9;
+      --line: #d8ddd6; --line-dark: #bdc9c3; --teal: #0e6f6a; --teal-deep: #07514f;
+      --teal-soft: #dcece7; --amber: #d38a37; --red: #a84f45;
+      --shadow: 0 20px 50px rgba(16, 37, 45, .10); --radius-lg: 22px; --radius-md: 14px;
+    }
+    * { box-sizing: border-box; }
+    html { min-width: 320px; background: var(--paper); }
+    body { min-height: 100vh; margin: 0; color: var(--ink); background: radial-gradient(circle at 12% 5%, rgba(211, 138, 55, .12), transparent 24rem), linear-gradient(135deg, #f8f6ef 0%, var(--paper) 55%, #e9efea 100%); font: 15px/1.65 "Microsoft YaHei", "Noto Sans SC", system-ui, sans-serif; }
+    button, textarea { font: inherit; } button { -webkit-tap-highlight-color: transparent; }
+    :focus-visible { outline: 3px solid rgba(211, 138, 55, .72); outline-offset: 3px; }
+
+    .site-header { position: relative; overflow: hidden; color: #f8fbf6; background: var(--ink); border-bottom: 1px solid rgba(255, 255, 255, .12); }
+    .site-header::before { position: absolute; inset: 0 0 0 56%; content: ""; background: repeating-linear-gradient(90deg, transparent 0 44px, rgba(255, 255, 255, .055) 45px, transparent 46px); transform: skewX(-18deg); transform-origin: right; }
+    .header-inner { position: relative; z-index: 1; max-width: 1400px; margin: 0 auto; padding: 22px 38px 26px; }
+    .topline { display: flex; align-items: center; justify-content: space-between; gap: 22px; }
+    .brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
+    .brand-mark { display: grid; width: 38px; height: 38px; place-items: center; flex: 0 0 auto; color: var(--ink); background: var(--amber); font: 800 13px/1 "Arial Narrow", sans-serif; letter-spacing: -.08em; border-radius: 9px 9px 9px 2px; box-shadow: 5px 5px 0 rgba(255, 255, 255, .10); }
+    .brand-name { font-size: 16px; font-weight: 800; letter-spacing: .09em; white-space: nowrap; }
+    .brand-sub { margin-left: 8px; color: #a8bcbb; font-size: 12px; letter-spacing: .04em; white-space: nowrap; }
+    .header-status { display: flex; align-items: center; gap: 8px; color: #b8cbc7; font-size: 12px; white-space: nowrap; }
+    .live-dot { width: 7px; height: 7px; background: #82c39e; border-radius: 50%; box-shadow: 0 0 0 5px rgba(130, 195, 158, .12); }
+    .hero { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: 32px; padding: 54px 0 20px; }
+    .eyebrow { margin: 0 0 12px; color: var(--amber); font: 700 11px/1.2 "Arial Narrow", sans-serif; letter-spacing: .18em; text-transform: uppercase; }
+    .hero h1 { max-width: 720px; margin: 0; color: #fbfcf6; font: 700 clamp(34px, 5vw, 64px)/1.05 "Arial Narrow", "Microsoft YaHei", sans-serif; letter-spacing: -.045em; }
+    .hero h1 em { color: #9fd2c5; font-style: normal; }
+    .hero-copy { max-width: 500px; margin: 18px 0 0; color: #b6c9c5; font-size: 15px; }
+    .hero-note { align-self: end; max-width: 185px; padding: 13px 15px; color: #d8e6df; border-left: 1px solid var(--amber); font-size: 12px; line-height: 1.5; }
+
+    main { position: relative; max-width: 1400px; margin: 0 auto; padding: 28px 38px 70px; }
+    .workspace { display: grid; grid-template-columns: minmax(0, 1.14fr) minmax(340px, .86fr); gap: 22px; align-items: start; }
+    .stack { display: grid; gap: 22px; min-width: 0; }
+    .panel { min-width: 0; background: var(--panel); border: 1px solid rgba(189, 201, 195, .9); border-radius: var(--radius-lg); box-shadow: var(--shadow); backdrop-filter: blur(10px); }
+    .query-panel { position: relative; overflow: hidden; padding: 30px; }
+    .query-panel::after { position: absolute; right: -48px; bottom: -72px; width: 210px; height: 210px; content: ""; border: 1px solid rgba(14, 111, 106, .17); border-radius: 50%; box-shadow: 0 0 0 23px rgba(14, 111, 106, .04), 0 0 0 48px rgba(14, 111, 106, .035); pointer-events: none; }
+    .panel-heading { display: flex; align-items: start; justify-content: space-between; gap: 18px; margin-bottom: 22px; }
+    .panel-heading h2 { margin: 0; font-size: 20px; letter-spacing: -.02em; }
+    .panel-index { color: var(--muted-light); font: 700 11px/1 "Arial Narrow", sans-serif; letter-spacing: .14em; }
+    .field-label { display: block; margin-bottom: 9px; color: var(--ink-soft); font-size: 12px; font-weight: 800; letter-spacing: .05em; }
+    textarea { position: relative; z-index: 1; display: block; width: 100%; min-height: 178px; resize: vertical; padding: 17px 18px; color: var(--ink); background: rgba(255, 254, 249, .94); border: 1px solid var(--line-dark); border-radius: 12px; font-size: 16px; line-height: 1.75; transition: border-color .2s, box-shadow .2s, background .2s; }
+    textarea::placeholder { color: #a3aeaa; }
+    textarea:hover { background: var(--white); border-color: #93aaa3; }
+    textarea:focus { background: var(--white); border-color: var(--teal); box-shadow: 0 0 0 4px rgba(14, 111, 106, .10); outline: none; }
+    .prompt-library { position: relative; z-index: 1; display: flex; flex-wrap: wrap; gap: 7px; margin-top: 13px; }
+    .prompt-chip { margin: 0; padding: 5px 10px; color: var(--muted); background: transparent; border: 1px solid var(--line); border-radius: 100px; cursor: pointer; font-size: 12px; transition: color .2s, border-color .2s, background .2s; }
+    .prompt-chip:hover { color: var(--teal-deep); background: var(--teal-soft); border-color: #a8ccc2; }
+    .query-footer { position: relative; z-index: 1; display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-top: 24px; }
+    .helper { max-width: 310px; color: var(--muted); font-size: 12px; line-height: 1.45; }
+    .primary-action { display: inline-flex; align-items: center; justify-content: center; gap: 9px; min-width: 143px; margin: 0; padding: 12px 18px; color: #fffef8; background: var(--teal); border: 0; border-radius: 10px; box-shadow: 0 8px 18px rgba(14, 111, 106, .20); cursor: pointer; font-weight: 800; transition: transform .2s, background .2s, box-shadow .2s; }
+    .primary-action::after { content: "↗"; font-size: 17px; line-height: 1; }
+    .primary-action:hover { background: var(--teal-deep); box-shadow: 0 10px 22px rgba(14, 111, 106, .28); transform: translateY(-1px); }
+    .primary-action:disabled { background: #8ca6a2; box-shadow: none; cursor: wait; transform: none; }
+
+    .result-panel { padding: 26px 30px 30px; }
+    .result-panel .panel-heading { margin-bottom: 14px; }
+    .result-panel .panel-heading h2 { font-size: 17px; }
+    .empty-state { display: grid; min-height: 190px; place-items: center; padding: 24px; color: var(--muted); background: linear-gradient(135deg, rgba(233, 236, 226, .52), rgba(255, 254, 249, .4)); border: 1px dashed #c8d1ca; border-radius: var(--radius-md); text-align: center; }
+    .empty-seal { display: grid; width: 46px; height: 46px; margin: 0 auto 10px; place-items: center; color: var(--teal); border: 1px solid #a8c9c0; border-radius: 50%; font-size: 20px; }
+    .status { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; margin: 0 0 14px; }
+    .badge { padding: 5px 10px; color: var(--teal-deep); background: var(--teal-soft); border-radius: 100px; font-size: 12px; font-weight: 800; }
+    .decision { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
+    .decision::before { width: 5px; height: 5px; content: ""; background: #69a77c; border-radius: 50%; }
+    .decision.warn::before { background: var(--amber); }
+    .decision.danger::before { background: var(--red); }
+    .trust-meter { display: inline-flex; align-items: center; gap: 7px; margin-left: auto; color: var(--muted); font-size: 12px; }
+    .trust-bar { width: 62px; height: 5px; overflow: hidden; background: #dfe5de; border-radius: 99px; }
+    .trust-bar span { display: block; height: 100%; background: var(--teal); border-radius: inherit; }
+    .answer { padding: 19px 21px; color: var(--ink); background: #fbfbf5; border: 1px solid #d9e0d8; border-left: 4px solid var(--amber); border-radius: 5px 13px 13px 5px; box-shadow: 0 7px 15px rgba(16, 37, 45, .04); font-size: 18px; line-height: 1.75; white-space: pre-wrap; }
+    .agent-note { margin-top: 13px; padding: 12px 14px; color: var(--muted); background: #f2f5ef; border: 1px solid #d9e0d8; border-radius: 8px; font-size: 12px; line-height: 1.6; }
+    .agent-note strong { color: var(--ink); }
+    .agent-options { display: grid; gap: 5px; margin-top: 7px; }
+    .agent-option { display: flex; justify-content: space-between; gap: 10px; padding: 5px 7px; background: rgba(255,255,255,.58); border-radius: 5px; }
+    .agent-workflow { margin-top: 14px; border: 1px solid #d5e0d8; border-radius: 9px; background: #f7f8f1; overflow: hidden; }
+    .agent-workflow summary { display: flex; align-items: center; justify-content: space-between; padding: 11px 13px; color: var(--ink); cursor: pointer; font-size: 12px; font-weight: 800; list-style: none; }
+    .agent-workflow summary::-webkit-details-marker { display: none; }
+    .agent-workflow summary::after { color: var(--teal); content: '查看执行记录 ↗'; font: 10px/1 "Arial Narrow", sans-serif; letter-spacing: .08em; }
+    .agent-workflow[open] summary { border-bottom: 1px solid #d5e0d8; background: #edf3ed; }
+    .workflow-body { padding: 12px 13px 13px; }
+    .workflow-label { margin: 0 0 7px; color: var(--muted); font-size: 10px; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; }
+    .workflow-tasks { display: flex; flex-wrap: wrap; gap: 6px; }
+    .workflow-task { padding: 5px 7px; color: var(--ink-soft); background: #fffef9; border: 1px solid #dce5de; border-radius: 5px; font-size: 11px; }
+    .workflow-task::before { display: inline-block; width: 6px; height: 6px; margin-right: 5px; content: ''; background: #69a77c; border-radius: 50%; }
+    .workflow-task.skipped::before { background: #b1b9b4; }
+    .workflow-claims { display: grid; gap: 5px; margin-top: 10px; }
+    .workflow-claim { padding: 7px 8px; color: var(--muted); background: rgba(255,255,255,.65); border-left: 2px solid var(--teal); font-size: 11px; line-height: 1.5; }
+    .workflow-check { margin-top: 10px; color: var(--muted); font-size: 11px; }
+    .workflow-check strong { color: var(--teal-deep); }
+    .trace { margin: 15px 0 0; color: var(--muted-light); font: 11px/1.4 "Arial Narrow", monospace; letter-spacing: .05em; overflow-wrap: anywhere; }
+
+    .evidence-panel { position: sticky; top: 20px; overflow: hidden; padding: 0; }
+    .evidence-head { padding: 26px 26px 21px; background: var(--ink); color: #f8fbf6; }
+    .evidence-head .panel-heading { margin: 0; }
+    .evidence-head h2 { margin: 0; color: #f8fbf6; font-size: 20px; }
+    .evidence-head .panel-index { color: #8ca9a5; }
+    .evidence-lede { margin: 10px 0 0; color: #a9c0bb; font-size: 12px; line-height: 1.5; }
+    .ledger { padding: 0 26px 22px; }
+    .evidence { position: relative; min-width: 0; padding: 18px 0 17px 22px; border-bottom: 1px solid var(--line); }
+    .evidence::before { position: absolute; top: 22px; bottom: -1px; left: 3px; width: 1px; content: ""; background: #cbd9d2; }
+    .evidence:last-of-type::before { bottom: 24px; }
+    .evidence::after { position: absolute; top: 22px; left: 0; width: 7px; height: 7px; content: ""; background: var(--amber); border: 3px solid var(--paper); border-radius: 50%; box-sizing: content-box; }
+    .evidence h3 { margin: 0 0 7px; color: var(--ink-soft); font-size: 11px; letter-spacing: .12em; text-transform: uppercase; }
+    .evidence code { display: block; max-width: 100%; color: var(--teal); font: 11px/1.45 "Cascadia Code", Consolas, monospace; overflow-wrap: anywhere; word-break: break-word; }
+    .evidence-source { margin-top: 7px; color: var(--ink); font-size: 13px; font-weight: 800; overflow-wrap: anywhere; word-break: break-word; }
+    .evidence-meta { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+    .evidence-pill { max-width: 100%; padding: 3px 7px; color: var(--muted); background: #edf1eb; border-radius: 5px; font-size: 11px; overflow-wrap: anywhere; word-break: break-word; }
+    .source-link { display: inline-flex; align-items: center; margin-top: 10px; padding: 5px 8px; color: var(--teal-deep); border: 1px solid #b9d4ca; border-radius: 5px; background: #f3faf5; font-size: 11px; font-weight: 800; text-decoration: none; transition: background .16s ease, border-color .16s ease, transform .16s ease; }
+    .source-link:hover { border-color: var(--teal); background: var(--teal-soft); transform: translateY(-1px); }
+    .evidence-context { margin-top: 9px; color: var(--muted); font-size: 12px; line-height: 1.55; overflow-wrap: anywhere; word-break: break-word; }
+    .evidence details { margin-top: 9px; font-size: 11px; }
+    .evidence summary { color: var(--teal); cursor: pointer; }
+    .evidence-raw { max-height: 180px; overflow: auto; margin-top: 7px; padding: 9px; color: var(--ink-soft); background: #f3f5ef; border-radius: 7px; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; }
+    .ledger .empty-state { min-height: 250px; margin: 22px 0; padding: 30px 22px; background: #f6f5ee; }
+    .ledger-note { padding-top: 14px; color: var(--muted-light); font-size: 11px; }
+    .catalog-panel { margin-top: 26px; padding: 26px; }
+    .catalog-panel .panel-heading { align-items: end; }
+    .catalog-description { max-width: 560px; margin: 10px 0 0; color: var(--muted); font-size: 13px; }
+    .catalog-tools { display: grid; grid-template-columns: minmax(180px, 1fr) 140px auto; gap: 10px; margin-top: 20px; }
+    .catalog-input, .catalog-select { width: 100%; min-height: 40px; padding: 8px 10px; color: var(--ink); border: 1px solid var(--line-dark); border-radius: 7px; background: #fffef9; font: inherit; }
+    .catalog-button { min-height: 40px; padding: 8px 14px; color: #f8fbf6; border: 1px solid var(--teal-deep); border-radius: 7px; background: var(--teal-deep); cursor: pointer; font-weight: 800; }
+    .catalog-button:hover { background: var(--teal); }
+    .catalog-list { display: grid; gap: 8px; margin-top: 15px; }
+    .catalog-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 14px; align-items: center; padding: 13px 14px; border: 1px solid #dce2da; border-radius: 8px; background: #fbfcf7; }
+    .catalog-title { color: var(--ink); font-size: 14px; font-weight: 800; overflow-wrap: anywhere; }
+    .catalog-meta { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 5px; color: var(--muted); font-size: 11px; }
+    .catalog-meta span::after { margin-left: 6px; color: var(--line-dark); content: '·'; }
+    .catalog-meta span:last-child::after { display: none; }
+    .catalog-open { padding: 5px 8px; color: var(--teal-deep); border: 1px solid #b9d4ca; border-radius: 5px; background: #f3faf5; font-size: 11px; font-weight: 800; text-decoration: none; white-space: nowrap; }
+    .catalog-open:hover { border-color: var(--teal); background: var(--teal-soft); }
+    .catalog-pagination { display: flex; align-items: center; justify-content: flex-end; gap: 9px; margin-top: 13px; color: var(--muted); font-size: 12px; }
+    .catalog-pagination button { padding: 4px 8px; color: var(--teal-deep); border: 1px solid var(--line-dark); border-radius: 5px; background: var(--white); cursor: pointer; }
+    .catalog-pagination button:disabled { cursor: not-allowed; opacity: .45; }
+    .footer-note { display: flex; justify-content: space-between; gap: 15px; max-width: 1400px; margin: 0 auto; padding: 0 38px 28px; color: var(--muted-light); font-size: 11px; }
+    .footer-note span:last-child { text-align: right; }
+
+    @media (max-width: 900px) {
+      .header-inner, main, .footer-note { padding-left: 22px; padding-right: 22px; }
+      .workspace { grid-template-columns: 1fr; }
+      .evidence-panel { position: static; }
+      .hero { grid-template-columns: 1fr; padding-top: 42px; }
+      .hero-note { max-width: 320px; }
+    }
+    @media (max-width: 560px) {
+      .header-inner { padding-top: 16px; padding-bottom: 20px; }
+      .brand-sub, .header-status { display: none; }
+      .hero { padding-top: 35px; }
+      .hero h1 { font-size: 39px; }
+      main { padding-top: 16px; padding-bottom: 42px; }
+      .query-panel, .result-panel { padding: 21px; }
+      .catalog-panel { padding: 21px; }
+      .evidence-head, .ledger { padding-left: 21px; padding-right: 21px; }
+      .catalog-tools { grid-template-columns: 1fr; }
+      .query-footer { align-items: stretch; flex-direction: column; }
+      .helper { max-width: none; }
+      .primary-action { width: 100%; }
+      .trust-meter { width: 100%; margin-left: 0; }
+      .footer-note { flex-direction: column; padding-bottom: 20px; }
+      .footer-note span:last-child { text-align: left; }
+    }
+    @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; } }
+  </style>
+</head>
+<body>
+  <header class="site-header">
+    <div class="header-inner">
+      <div class="topline">
+        <div class="brand"><span class="brand-mark" aria-hidden="true">BR</span><span class="brand-name">BANKREG</span><span class="brand-sub">TRUSTRAG / 可信监管问答</span></div>
+        <div class="header-status" id="systemStatus"><span class="live-dot" aria-hidden="true"></span><span>本地证据库连接中</span></div>
+      </div>
+      <div class="hero">
+        <div><p class="eyebrow">Evidence first · 证据优先</p><h1>把监管问题，<em>问到证据上。</em></h1><p class="hero-copy">面向银行监管制度与统计报表的可信问答。每个结论都保留来源、期间、单元格或段落位置。</p></div>
+        <div class="hero-note">先定位事实，再判断结论。证据不足时，系统会明确请求补充或拒绝猜测。</div>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <div class="workspace">
+      <div class="stack">
+        <section class="panel query-panel" aria-labelledby="query-title">
+          <div class="panel-heading"><div><p class="eyebrow">Query desk</p><h2 id="query-title">提出一个监管问题</h2></div><span class="panel-index">01 / ASK</span></div>
+          <label class="field-label" for="question">问题内容</label>
+          <textarea id="question" aria-describedby="query-help" placeholder="例如：2025年商业银行主要监管指标情况表中的不良贷款率是多少？"></textarea>
+          <div class="prompt-library" aria-label="示例问题"><button class="prompt-chip" type="button" data-question="2025年商业银行主要监管指标情况表中的不良贷款率是多少？">表格取数</button><button class="prompt-chip" type="button" data-question="请查询银行业监管制度中关于资本充足率的要求。">制度检索</button><button class="prompt-chip" type="button" data-question="根据监管制度和2025年商业银行主要监管指标情况表，判断当前不良贷款率是否满足监管要求，并说明计算依据。">跨文件判断</button></div>
+          <div class="query-footer"><p class="helper" id="query-help">支持监管事实、条款阈值、业务流程、统计表查询和跨文件判断。</p><button id="ask" class="primary-action" type="button">检索并回答</button></div>
+        </section>
+
+        <section class="panel result-panel" aria-labelledby="result-title">
+          <div class="panel-heading"><div><p class="eyebrow">Decision record</p><h2 id="result-title">回答与判断</h2></div><span class="panel-index">02 / ANSWER</span></div>
+          <div id="result" class="empty-state" aria-live="polite"><div><div class="empty-seal" aria-hidden="true">⌁</div><div>提交问题后，这里会显示结论、信任分和追踪编号。</div></div></div>
+        </section>
+      </div>
+
+      <aside class="panel evidence-panel" aria-labelledby="evidence-title">
+        <div class="evidence-head"><div class="panel-heading"><div><p class="eyebrow">Source ledger</p><h2 id="evidence-title">证据链</h2></div><span class="panel-index">03 / PROOF</span></div><p class="evidence-lede">从原始文件到最小证据单元，记录每一步依据。</p></div>
+        <div id="evidence" class="ledger" aria-live="polite"><div class="empty-state"><div><div class="empty-seal" aria-hidden="true">⌑</div><div>尚未建立证据链</div><p class="muted">提交问题后显示 Evidence ID、源文件和单元格/段落位置。</p></div></div></div>
+      </aside>
+    </div>
+
+    <section class="panel catalog-panel" aria-labelledby="catalog-title">
+      <div class="panel-heading"><div><p class="eyebrow">Knowledge catalogue</p><h2 id="catalog-title">知识库目录</h2><p class="catalog-description">浏览已导入的制度、报表与附件。目录仅展示资料元数据；打开操作仍受数据集目录边界保护。</p></div><span class="panel-index">04 / LIBRARY</span></div>
+      <div class="catalog-tools"><input id="catalogQuery" class="catalog-input" type="search" placeholder="按标题、文件名、机构或文号搜索" aria-label="搜索知识库"><select id="catalogType" class="catalog-select" aria-label="资料类型"><option value="">全部类型</option><option value="word">制度文档</option><option value="pdf">PDF</option><option value="excel">统计报表</option></select><button id="catalogSearch" class="catalog-button" type="button">查询目录</button></div>
+      <div id="catalogList" class="catalog-list" aria-live="polite"><div class="muted">点击“查询目录”加载已导入资料。</div></div>
+      <div id="catalogPagination" class="catalog-pagination"></div>
+    </section>
+  </main>
+
+  <div class="footer-note"><span>BankReg-TrustRAG · 本地知识库</span><span>答案可追溯 · 证据可核验 · 不确定时拒答</span></div>
+
+  <script>
+    const q = document.querySelector('#question'), ask = document.querySelector('#ask'), result = document.querySelector('#result'), evidence = document.querySelector('#evidence'), systemStatus = document.querySelector('#systemStatus'), catalogQuery = document.querySelector('#catalogQuery'), catalogType = document.querySelector('#catalogType'), catalogSearch = document.querySelector('#catalogSearch'), catalogList = document.querySelector('#catalogList'), catalogPagination = document.querySelector('#catalogPagination');
+    const catalogPageSize = 10; let catalogOffset = 0;
+    const qaTypeLabels = { regulatory_fact:'监管事实', clause_threshold:'条款与阈值', business_process:'业务流程', table_lookup:'统计表查询', cross_file_judgment:'跨文件判断' };
+    const decisionLabels = { answer:'已回答', clarify:'需要补充信息', refuse:'拒绝回答' };
+    const escapeHtml = value => String(value ?? '').replace(/[&<>\"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[char]));
+    const readableValue = value => { if (value === null || value === undefined || value === '') return ''; if (typeof value !== 'string') return String(value); try { const parsed = JSON.parse(value); return typeof parsed === 'string' ? parsed : JSON.stringify(parsed); } catch { return value.replace(/^\"|\"$/g, ''); } };
+    const shorten = (value, limit=260) => { const text = String(value ?? ''); return text.length > limit ? `${text.slice(0, limit)}…` : text; };
+    const decisionClass = decision => decision === 'refuse' ? 'danger' : decision === 'clarify' ? 'warn' : '';
+    const renderEvidence = (items, evidenceRoles = {}) => {
+      const shown = items.slice(0, 4);
+      const cards = shown.map((e, index) => {
+        const table = e.kind === 'table' || e.cell_address, source = e.source_title || e.source_file_name || '未标注来源';
+        const location = table ? `${e.sheet_name || e.table_name || '工作表'} · ${e.cell_address || '未标注单元格'}` : [e.page && `第${e.page}页`, e.paragraph_no && `段落${e.paragraph_no}`].filter(Boolean).join(' · ') || '未标注段落';
+        const value = readableValue(e.value_text), summary = table ? [e.indicator && `指标：${e.indicator}`, e.period && `期间：${e.period}`, value && `值：${value}`, e.unit && `单位：${e.unit}`].filter(Boolean).join(' · ') : (e.content || e.context || ''), raw = e.context || e.content || e.column_header || '';
+        const role = evidenceRoles[e.evidence_id], sourceLink = e.doc_id ? `<a class="source-link" href="/api/documents/${encodeURIComponent(e.doc_id)}/source" target="_blank" rel="noopener">打开原始文件 ↗</a>` : '';
+        return `<article class="evidence"><h3>证据 ${String(index + 1).padStart(2, '0')}</h3><code>${escapeHtml(e.evidence_id || '未标注证据')}</code><div class="evidence-source">${escapeHtml(source)}</div><div class="evidence-meta"><span class="evidence-pill">${escapeHtml(location)}</span>${role ? `<span class="evidence-pill">${escapeHtml(role)}</span>` : ''}${table && e.source_file_name ? `<span class="evidence-pill">${escapeHtml(e.source_file_name)}</span>` : ''}</div><div class="evidence-context">${escapeHtml(shorten(summary))}</div>${sourceLink}${raw ? `<details><summary>查看原始上下文</summary><div class="evidence-raw">${escapeHtml(raw)}</div></details>` : ''}</article>`;
+      }).join('');
+      const note = items.length > shown.length ? `<div class="ledger-note">已展示最相关的 ${shown.length} 条，共 ${items.length} 条。</div>` : '';
+      return cards + note || '<div class="empty-state"><div><div class="empty-seal" aria-hidden="true">⌑</div><div>没有可展示证据</div></div></div>';
+    };
+    const setLoading = loading => { ask.disabled = loading; ask.textContent = loading ? '正在检索' : '检索并回答'; if (loading) result.innerHTML = '<div class="empty-state"><div><div class="empty-seal" aria-hidden="true">↻</div><div>正在检索本地证据并校验结论…</div></div></div>'; };
+    const renderAgentNote = agent => {
+      if (!agent || agent.route !== 'choice_agent') return '';
+      const hitl = agent.human_in_loop || {}, pending = hitl.status === 'pending';
+      const options = (agent.options || []).map(item => `<div class="agent-option"><span><strong>${escapeHtml(item.label)}</strong> · ${escapeHtml(shorten(item.text, 80))}</span><span>证据 ${item.evidence_ids?.length || 0} 条 · ${Number(item.score || 0).toFixed(3)}</span></div>`).join('');
+      return `<div class="agent-note"><strong>${pending ? '已转人工确认' : '选择题 Agent 已完成'}</strong>：已识别用户意图，并对每个选项分别检索。${pending ? escapeHtml(hitl.prompt || '请人工核对证据后确认选项。') : '选中项必须有充分证据且与其他选项拉开差距。'}<div class="agent-options">${options}</div></div>`;
+    };
+    const renderAgentWorkflow = workflow => {
+      if (!workflow || !Array.isArray(workflow.tasks)) return '';
+      const tasks = workflow.tasks.map(task => `<span class="workflow-task ${escapeHtml(task.status || '')}">${escapeHtml(task.agent || task.id)} · ${task.status === 'skipped' ? '跳过' : '完成'}</span>`).join('');
+      const claims = (workflow.answer_generation?.claims || []).slice(0, 3).map(claim => `<div class="workflow-claim"><strong>${claim.supported ? '已核验 Claim' : '待核验 Claim'}</strong> · ${escapeHtml(shorten(claim.text, 96))}<br><code>${escapeHtml((claim.evidence_ids || []).join(' · ') || '未关联证据')}</code></div>`).join('');
+      const verification = workflow.assisted_verification || {}, status = verification.passed ? '通过' : '未通过 / 已执行保护决策';
+      return `<details class="agent-workflow"><summary>Agent 执行记录</summary><div class="workflow-body"><p class="workflow-label">查询计划</p><div class="workflow-tasks">${tasks}</div>${claims ? `<p class="workflow-label" style="margin-top:12px">Claim 与证据</p><div class="workflow-claims">${claims}</div>` : ''}<div class="workflow-check">辅助核验：<strong>${escapeHtml(status)}</strong>${verification.retry ? ' · 已执行一次证据重检索' : ''}</div></div></details>`;
+    };
+    const loadCatalog = async (offset = 0) => {
+      catalogOffset = Math.max(0, offset); catalogList.innerHTML = '<div class="muted">正在加载资料目录…</div>'; catalogPagination.innerHTML = '';
+      try {
+        const params = new URLSearchParams({limit:String(catalogPageSize), offset:String(catalogOffset)});
+        if (catalogQuery.value.trim()) params.set('query', catalogQuery.value.trim());
+        if (catalogType.value) params.set('document_type', catalogType.value);
+        const response = await fetch(`/api/documents?${params}`), payload = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(payload.detail || `HTTP ${response.status}`);
+        const items = payload.items || [];
+        catalogList.innerHTML = items.length ? items.map(item => {
+          const meta = [item.document_type === 'excel' ? '统计报表' : item.document_type === 'word' ? '制度文档' : item.document_type === 'pdf' ? 'PDF' : item.document_type, item.authority, item.publish_date, item.status === 'effective' ? '有效' : item.status, item.file_name].filter(Boolean).map(value => `<span>${escapeHtml(value)}</span>`).join('');
+          return `<article class="catalog-row"><div><div class="catalog-title">${escapeHtml(item.title || item.file_name || '未命名资料')}</div><div class="catalog-meta">${meta}</div></div><a class="catalog-open" href="/api/documents/${encodeURIComponent(item.doc_id)}/source" target="_blank" rel="noopener">打开原文件 ↗</a></article>`;
+        }).join('') : '<div class="muted">没有找到匹配的资料，请调整搜索条件。</div>';
+        const start = items.length ? catalogOffset + 1 : 0, end = catalogOffset + items.length, total = Number(payload.total || 0);
+        catalogPagination.innerHTML = `<span>${start}–${end} / ${total} 份资料</span><button type="button" ${catalogOffset === 0 ? 'disabled' : ''} data-catalog-offset="${Math.max(0, catalogOffset - catalogPageSize)}">上一页</button><button type="button" ${end >= total ? 'disabled' : ''} data-catalog-offset="${catalogOffset + catalogPageSize}">下一页</button>`;
+      } catch (error) { catalogList.innerHTML = `<div class="muted">目录加载失败：${escapeHtml(error instanceof Error ? error.message : String(error))}</div>`; }
+    };
+    const submitQuestion = async () => {
+      if (!q.value.trim() || ask.disabled) return;
+      setLoading(true); evidence.innerHTML = '<div class="empty-state"><div><div class="empty-seal" aria-hidden="true">↻</div><div>正在整理证据链…</div></div></div>';
+      try {
+        const r = await fetch('/api/qa', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({question:q.value}) }), d = await r.json().catch(() => ({}));
+        if (!r.ok) { const detail = Array.isArray(d.detail) ? d.detail.map(item => item.msg || item).join('；') : (d.detail || '服务端返回错误'); throw new Error(`HTTP ${r.status}：${detail}`); }
+        if (!d || !d.trust || typeof d.trust.score !== 'number') throw new Error('接口返回格式异常：缺少 trust.score');
+        const agent = d.query_plan?.agent || {}, hitl = agent.human_in_loop || {}, qaTypeLabel = agent.intent === 'multiple_choice' ? '选择题' : (qaTypeLabels[d.qa_type] || d.qa_type || '问答'), decisionLabel = hitl.status === 'pending' ? '需要人工确认' : (decisionLabels[d.trust.decision] || d.trust.decision || '未判定'), score = Math.max(0, Math.min(1, Number(d.trust.score)));
+        const workflow = d.query_plan?.agent_workflow || {}, evidenceRoles = Object.fromEntries((workflow.evidence_organization?.items || []).map(item => [item.evidence_id, item.role]));
+        result.innerHTML = `<div class="status"><span class="badge">${escapeHtml(qaTypeLabel)}</span><span class="decision ${decisionClass(d.trust.decision)}">${escapeHtml(decisionLabel)}</span><span class="trust-meter">信任分 ${escapeHtml(d.trust.score)}<span class="trust-bar"><span style="width:${score * 100}%"></span></span><span>${escapeHtml(d.latency_ms)} ms</span></span></div><div class="answer"></div>${renderAgentNote(agent)}${renderAgentWorkflow(workflow)}<p class="trace">TRACE / ${escapeHtml(d.trace_id)}</p>`;
+        result.querySelector('.answer').textContent = d.answer; evidence.innerHTML = renderEvidence(d.evidence || [], evidenceRoles);
+      } catch (error) {
+        result.innerHTML = `<div class="empty-state"><div><div class="empty-seal" aria-hidden="true">!</div><div>请求未完成</div><p class="muted">${escapeHtml(error instanceof Error ? error.message : String(error))}</p></div></div>`;
+        evidence.innerHTML = '<div class="empty-state"><div><div class="empty-seal" aria-hidden="true">⌑</div><div>本次没有建立证据链</div></div></div>';
+      } finally { setLoading(false); }
+    };
+    ask.addEventListener('click', submitQuestion);
+    q.addEventListener('keydown', event => { if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') submitQuestion(); });
+    catalogSearch.addEventListener('click', () => loadCatalog(0));
+    catalogQuery.addEventListener('keydown', event => { if (event.key === 'Enter') loadCatalog(0); });
+    catalogPagination.addEventListener('click', event => { const target = event.target.closest('[data-catalog-offset]'); if (target && !target.disabled) loadCatalog(Number(target.dataset.catalogOffset)); });
+    document.querySelectorAll('.prompt-chip').forEach(chip => chip.addEventListener('click', () => { q.value = chip.dataset.question || ''; q.focus(); }));
+    fetch('/health').then(response => response.json()).then(data => { if (data.status === 'ok') systemStatus.innerHTML = `<span class="live-dot" aria-hidden="true"></span><span>本地索引在线 · ${escapeHtml(data.documents || 0)} 份资料</span>`; else throw new Error('offline'); }).catch(() => { systemStatus.innerHTML = '<span class="live-dot" style="background:#d38a37" aria-hidden="true"></span><span>等待服务连接</span>'; });
+  </script>
+</body>
+</html>

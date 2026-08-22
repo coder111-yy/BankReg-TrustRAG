@@ -1,0 +1,26 @@
+# 密钥与本机配置
+.env
+.env.*
+!.env.example
+
+# Python 本机环境与缓存
+.venv/
+__pycache__/
+**/__pycache__/
+.pytest_cache/
+*.py[cod]
+
+# 授权竞赛数据与本地数据目录
+03-*/
+data/
+BankReg-TrustRAG_project/
+
+# 生成的知识库、模型、向量索引与评测产物
+artifacts/
+
+# 本地渲染、打包和系统文件
+_project_book_render*/
+dist/
+*.zip
+.DS_Store
+Thumbs.db
