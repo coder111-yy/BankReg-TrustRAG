@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import re
 import subprocess
+import shutil
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -113,19 +115,87 @@ def parse_docx(path: Path, doc: Document) -> list[TextEvidence]:
     return _paragraph_evidence(doc, source)
 
 
-def parse_legacy_doc(path: Path, doc: Document) -> tuple[list[TextEvidence], list[str]]:
-    warnings: list[str] = []
+def parse_legacy_doc(
+    path: Path,
+    doc: Document
+) -> tuple[list[TextEvidence], list[str]]:
+    """
+    使用 LibreOffice 将旧版 .doc 转换为 .docx，
+    然后复用现有的 parse_docx() 解析正文和表格。
+    """
+
+    # 1. 优先从 PATH 查找 soffice
+    soffice = shutil.which("soffice")
+
+    # 2. Windows 常见 LibreOffice 安装位置
+    if not soffice:
+        candidates = [
+            Path(r"C:\Program Files\LibreOffice\program\soffice.exe"),
+            Path(r"C:\Program Files (x86)\LibreOffice\program\soffice.exe"),
+        ]
+
+        for candidate in candidates:
+            if candidate.exists():
+                soffice = str(candidate)
+                break
+
+    if not soffice:
+        return [], [
+            "LibreOffice not found. "
+            "Please install LibreOffice or add soffice.exe to PATH."
+        ]
+
     try:
-        completed = subprocess.run(["antiword", str(path)], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=90)
-        if completed.returncode == 0 and completed.stdout.strip():
-            return _paragraph_evidence(doc, [(p, None, None, None) for p in completed.stdout.splitlines()]), []
-        warnings.append(f"antiword returned {completed.returncode}: {completed.stderr[:300]}")
-    except (FileNotFoundError, subprocess.SubprocessError) as exc:
-        warnings.append(f"legacy .doc parser unavailable: {exc}")
-    fallback = _parse_wps_utf16_doc(path)
-    if fallback:
-        return _paragraph_evidence(doc, [(p, None, None, None) for p in fallback.splitlines()]), warnings + ["used local OLE/UTF-16 fallback for legacy .doc"]
-    return [], warnings
+        # 使用临时目录，避免转换后的 docx 污染原始数据目录
+        with tempfile.TemporaryDirectory(prefix="bankreg_doc_") as temp_dir:
+            temp_path = Path(temp_dir)
+
+            completed = subprocess.run(
+                [
+                    soffice,
+                    "--headless",
+                    "--convert-to",
+                    "docx",
+                    "--outdir",
+                    str(temp_path),
+                    str(path),
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=120,
+            )
+
+            if completed.returncode != 0:
+                return [], [
+                    f"LibreOffice conversion failed "
+                    f"(returncode={completed.returncode}): "
+                    f"{completed.stderr[:500]}"
+                ]
+
+            # LibreOffice 转换后的文件
+            converted_path = temp_path / f"{path.stem}.docx"
+
+            if not converted_path.exists():
+                return [], [
+                    f"LibreOffice conversion produced no DOCX file: {path}"
+                ]
+
+            # 直接复用现有 DOCX 解析逻辑
+            evidence = parse_docx(converted_path, doc)
+
+            return evidence, []
+
+    except subprocess.TimeoutExpired:
+        return [], [
+            f"LibreOffice conversion timeout: {path}"
+        ]
+
+    except Exception as exc:
+        return [], [
+            f"LibreOffice .doc parser failed: {exc}"
+        ]
 
 
 def _parse_wps_utf16_doc(path: Path) -> str:
