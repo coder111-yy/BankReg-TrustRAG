@@ -32,13 +32,13 @@ def verify_claims(answer: str, question: str, hits: list[Hit], claims: list[str]
     # Dates such as 2023-10 contain a negative-looking month token when
     # parsed by the generic number matcher.  Remove date expressions before
     # comparing metric values; dates are verified separately below.
-    answer_numbers = numbers_in(_without_dates(answer))
+    answer_numbers = numbers_in(_without_dates(_without_citations(answer)))
     evidence_numbers = numbers_in(_without_dates(evidence))
     for number in answer_numbers:
         if not any(abs(number - expected) < max(1e-9, abs(expected) * 1e-8) for expected in evidence_numbers):
             verification.numeric_ok = False
             verification.unsupported_claims.append(f"数字 {number:g} 未在证据中找到")
-    dates = re.findall(r"20\d{2}(?:[-年]\d{1,2}(?:[-月]\d{1,2}日?)?)?", answer)
+    dates = re.findall(r"20\d{2}(?:[-年]\d{1,2}(?:[-月]\d{1,2}日?)?)?", _without_citations(answer))
     if dates and not all(_date_supported(date, evidence) for date in dates):
         verification.date_ok = False
         verification.unsupported_claims.append("回答中的日期未被证据支持")
@@ -66,7 +66,7 @@ def verify_claims(answer: str, question: str, hits: list[Hit], claims: list[str]
 def _evidence_for_hit(hit: Hit) -> str:
     return " ".join(str(hit.item.get(key) or "") for key in [
         "content", "context_window", "context", "indicator", "period", "value_text", "row_header",
-        "column_header", "source_title", "source_file_name", "table_name",
+        "column_header", "unit", "source_title", "source_file_name", "table_name",
     ])
 
 
@@ -77,6 +77,12 @@ def _verify_claims_against_individual_evidence(claims: list[str], hits: list[Hit
         if not text:
             continue
         evidence_ids = [hit.evidence_id for hit in hits if _claim_supported(text, _evidence_for_hit(hit))]
+        # A deterministic multi-quarter lookup intentionally renders several
+        # exact values in one claim.  No single cell contains all values, so
+        # verify the claim against the union of its retrieved evidence while
+        # retaining the complete supporting ID chain.
+        if not evidence_ids and len(hits) > 1 and _claim_supported(text, "\n".join(_evidence_for_hit(hit) for hit in hits)):
+            evidence_ids = [hit.evidence_id for hit in hits]
         results.append({
             "claim_id": f"claim_{index + 1}",
             "text": text,
@@ -172,6 +178,15 @@ def _claim_supported(claim: str, evidence: str) -> bool:
 
 def _without_dates(text: str) -> str:
     return re.sub(r"20\d{2}(?:年\s*\d{1,2}月?\s*\d{0,2}日?|[-/]\d{1,2}(?:[-/]\d{1,2})?)?", "", normalize_text(text))
+
+
+def _without_citations(text: str) -> str:
+    """Remove inline evidence labels before numeric/entity validation.
+
+    Evidence IDs commonly contain digits such as ``text:DOC_12:p3``. Those
+    digits are identifiers, not factual claims from the answer.
+    """
+    return re.sub(r"\[\s*(?:证据|evidence)\s*[:：][^\]]+\]", "", text, flags=re.IGNORECASE)
 
 
 def _date_supported(date: str, evidence: str) -> bool:

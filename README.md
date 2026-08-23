@@ -12,6 +12,7 @@
 - 跨文件判断采用“监管规则/指标解释 → 统计表数值 → 确定性比较”的流程。
 - 前端采用“监管证据台账”风格，显示信任分、决策、追踪编号和证据链。
 - 选择题由 Choice Agent 先识别意图，再对 A/B/C/D 选项分别检索和逐项核验；证据不足或选项得分接近时转入人工确认，不自动猜测。
+- 可选接入本地或获授权的 OpenAI-compatible 大模型：检索到的最小证据集会进入上下文，模型回答必须经过 Claim、数字、日期和规范性用语核验；模型不可用或核验失败时回退到可审计的确定性答案。
 
 ## 目录说明
 
@@ -58,6 +59,19 @@ Copy-Item .env.example .env
 BANKREG_BGE_MODE=required
 BANKREG_BGE_LOCAL_FILES_ONLY=1
 ```
+
+### 接入大模型生成
+
+默认 `BANKREG_LLM_PROVIDER=none`，不调用任何大模型，也不需要 API Key。若使用本地 Ollama、vLLM 或其他 OpenAI-compatible 服务，请配置：
+
+```env
+BANKREG_LLM_PROVIDER=openai_compatible
+BANKREG_LLM_MODEL=你的模型名
+BANKREG_LLM_BASE_URL=http://127.0.0.1:11434/v1
+BANKREG_LLM_API_KEY=
+```
+
+系统只把选中的证据文本、来源标题、页码/单元格位置和确定性计算事实发送到该地址，不发送本地文件路径。使用外部地址前，必须确认数据授权和合规要求。
 
 开发环境暂时没有模型时，可以改为：
 

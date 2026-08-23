@@ -86,7 +86,7 @@ def _hit_blob(hit: Hit) -> str:
 
 
 def _quarter_label(hit: Hit) -> str | None:
-    text = normalize_text(" ".join(str(hit.item.get(key) or "") for key in ["column_header", "context", "period"]))
+    text = normalize_text(" ".join(str(hit.item.get(key) or "") for key in ["row_header", "column_header", "context", "period"]))
     match = re.search(r"([一二三四1-4])季度", text)
     if not match:
         return None
@@ -427,6 +427,54 @@ def table_answer(question: str, choices: list[str] | None, hits: list[Hit]) -> A
         key=lambda hit: _numeric_match_score(hit, question, requested_indicator, requested_quarter, requested_row, requested_column),
         reverse=True,
     )
+
+    # Some regulatory workbooks store one year in ``period`` and represent the
+    # four reporting quarters as repeated row blocks.  A year-only question is
+    # therefore a multi-value lookup, not a request for whichever cell BGE
+    # happened to rank first.  Keep one exact numeric cell per quarter and
+    # expose all four cells to the answer generator and verifier.
+    if requested_quarter is None:
+        by_quarter: dict[str, Hit] = {}
+        for hit in numeric_hits:
+            quarter = _quarter_label(hit)
+            if not quarter:
+                continue
+            previous = by_quarter.get(quarter)
+            if previous is None or _numeric_match_score(hit, question, requested_indicator, None, requested_row, requested_column) > _numeric_match_score(previous, question, requested_indicator, None, requested_row, requested_column):
+                by_quarter[quarter] = hit
+        if len(by_quarter) >= 2:
+            ordered = [by_quarter[label] for label in ("一季度", "二季度", "三季度", "四季度") if label in by_quarter]
+            values: list[dict[str, Any]] = []
+            display_parts: list[str] = []
+            for hit in ordered:
+                item = hit.item
+                raw_value = _load_table_value(item.get("value_text"))
+                display_value, unit, unit_inferred = _format_table_value(raw_value, item.get("indicator"), item.get("unit"))
+                quarter = _quarter_label(hit) or "该季度"
+                values.append({
+                    "quarter": quarter,
+                    "value": display_value,
+                    "raw_value": raw_value,
+                    "cell": item.get("cell_address"),
+                    "evidence_id": hit.evidence_id,
+                })
+                display_parts.append(f"{quarter}{display_value}")
+            year = normalize_text(ordered[0].item.get("period")) or "该年度"
+            indicator_text = requested_indicator or ordered[0].item.get("indicator") or "该指标"
+            dimension = f"在“{requested_column}”口径下" if requested_column else ""
+            answer = f"“{indicator_text}”{dimension}，{year}年各季度数值为：" + "；".join(display_parts) + "。"
+            operation: dict[str, Any] = {
+                "type": "table_lookup",
+                "values": values,
+                "display_evidence_ids": [hit.evidence_id for hit in ordered],
+                "period": year,
+            }
+            if requested_row:
+                operation["row_label"] = requested_row
+            if requested_column:
+                operation["column_label"] = requested_column
+            return AnswerDraft(answer, [answer], [operation])
+
     selected_hit = numeric_hits[0]
     top = selected_hit.item
     raw_value = _load_table_value(top.get("value_text"))

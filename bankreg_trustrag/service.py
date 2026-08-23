@@ -8,6 +8,7 @@ from typing import Any
 
 from .agent import build_agent_workflow, identify_intent, organize_evidence, run_choice_agent
 from .config import Settings
+from .generation import GroundedGenerator, split_grounded_claims
 from .query import classify_question_scope, extract_inline_choices, parse_query
 from .reasoning import AnswerDraft, reason
 from .retrieval.index import HybridIndex
@@ -21,6 +22,7 @@ class TrustRAGService:
     def __init__(self, settings: Settings, store: Store | None = None):
         self.settings = settings
         self.store = store or Store(settings.db_path)
+        self.generator = GroundedGenerator.from_settings(settings)
         if self.store.document_count() == 0 and (settings.artifact_dir / "documents.jsonl").exists():
             self.store.load_jsonl(settings.artifact_dir)
         self.semantic = BGEPipeline(
@@ -157,6 +159,43 @@ class TrustRAGService:
                 draft = _choice_answer_draft(choice_result)
             else:
                 draft = reason(question_for_retrieval, parsed.qa_type, None, hits)
+        llm_generation = self.generator.status() if hasattr(self, "generator") else {"provider": "none", "enabled": False, "status": "disabled"}
+        if choice_result is None and hits and not _has_terminal_operation(draft.operations):
+            generator = getattr(self, "generator", None)
+            if generator is not None and generator.enabled:
+                context_hits = _minimal_display_hits(hits, draft.operations, None)
+                generated = generator.generate(question_for_retrieval, parsed, context_hits, draft.operations)
+                llm_generation = {
+                    **generator.status(),
+                    "status": generated.status,
+                    "context_evidence_ids": list(generated.context_evidence_ids),
+                }
+                generation_operation = {
+                    "type": "llm_generation",
+                    "provider": generator.config.provider,
+                    "model": generator.config.model,
+                    "status": generated.status,
+                    "context_evidence_ids": list(generated.context_evidence_ids),
+                }
+                if generated.error:
+                    generation_operation["error"] = generated.error
+                if generated.answer:
+                    candidate = AnswerDraft(
+                        generated.answer,
+                        split_grounded_claims(generated.answer),
+                        [*draft.operations, generation_operation],
+                    )
+                    candidate_verification = verify_claims(candidate.answer, question, hits, candidate.claims)
+                    if candidate_verification.passed:
+                        generation_operation["status"] = "accepted"
+                        draft = candidate
+                        llm_generation["status"] = "accepted"
+                    else:
+                        generation_operation["status"] = "rejected_by_verification"
+                        generation_operation["unsupported_claims"] = candidate_verification.unsupported_claims[:5]
+                        draft.operations.append(generation_operation)
+                else:
+                    draft.operations.append(generation_operation)
         verification = verify_claims(draft.answer, question, hits, draft.claims)
         retry_record: dict[str, Any] | None = None
         if _should_retry_verification(verification, draft, choice_result, missing_year):
@@ -250,8 +289,12 @@ class TrustRAGService:
             "requires_multi_hop": parsed.requires_multi_hop,
             "retrieval_routes": retrieval_routes,
             "model_status": self.index.model_status if hasattr(self.index, "model_status") else {"mode": "unknown"},
+            "generation": llm_generation,
             "retrieved_evidence_ids": [hit.evidence_id for hit in hits],
-            "minimal_evidence_ids": [hit.evidence_id for hit in display_hits[:3]],
+            # A multi-quarter table lookup deliberately carries one exact cell
+            # per quarter.  Do not truncate that evidence chain to three cells;
+            # the same complete set is passed to the grounded LLM context.
+            "minimal_evidence_ids": [hit.evidence_id for hit in display_hits],
             "operations": draft.operations,
             "scope": scope,
             "agent": identify_intent(question_for_retrieval, effective_choices, parsed.qa_type),
@@ -356,6 +399,10 @@ def _draft_confidence(draft: Any) -> float:
     return 0.0
 
 
+def _has_terminal_operation(operations: list[dict[str, Any]]) -> bool:
+    return any(operation.get("type") in {"refusal", "clarification", "human_in_loop"} for operation in operations)
+
+
 def _requested_year_missing(years: list[str], hits: list[Any]) -> str | None:
     if not years:
         return None
@@ -438,8 +485,9 @@ def _finalize_agent_workflow(
         "items": organize_evidence(hits, minimal_evidence_ids, draft.operations),
     }
     workflow["answer_generation"] = {
-        "strategy": "grounded_deterministic_template",
+        "strategy": "llm_grounded_with_deterministic_fallback" if any(operation.get("type") == "llm_generation" and operation.get("status") == "accepted" for operation in draft.operations) else "grounded_deterministic_template",
         "claims": verification.claim_results,
+        "llm": next((operation for operation in draft.operations if operation.get("type") == "llm_generation"), None),
     }
     workflow["assisted_verification"] = {
         "passed": verification.passed,

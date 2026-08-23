@@ -206,6 +206,98 @@ def _period_from_header(header: str | None) -> str | None:
     return m.group(1) if m else value if re.search(r"\d", value) else None
 
 
+_QUARTER_LABELS = {"一季度", "二季度", "三季度", "四季度"}
+
+
+def _quarter_label(value: Any) -> str | None:
+    """Normalize the quarter marker used by block-form statistical sheets."""
+    text = normalize_text(value)
+    if text in _QUARTER_LABELS:
+        return text
+    match = re.fullmatch(r"第?([一二三四1-4])季度", text)
+    if not match:
+        return None
+    return {
+        "一": "一季度", "1": "一季度",
+        "二": "二季度", "2": "二季度",
+        "三": "三季度", "3": "三季度",
+        "四": "四季度", "4": "四季度",
+    }[match.group(1)]
+
+
+def _infer_unit(*values: Any) -> str | None:
+    match = re.search(r"(百分比|%|％|‰|亿元|万元|百万元|元)", " ".join(normalize_text(value) for value in values if value))
+    return match.group(1) if match else None
+
+
+def _looks_like_quarter_matrix(rows: list[list[Any]], header_rows: int) -> bool:
+    """Detect quarter blocks x indicator rows x institution columns."""
+    if header_rows < 2 or max((len(row) for row in rows), default=0) < 3:
+        return False
+    active_quarter: str | None = None
+    quarter_count = 0
+    metric_rows = 0
+    for row in rows[header_rows:header_rows + 60]:
+        if not row:
+            continue
+        quarter = _quarter_label(row[0] if len(row) > 0 else None)
+        if quarter:
+            active_quarter = quarter
+            quarter_count += 1
+        metric = normalize_text(row[1] if len(row) > 1 else None)
+        values = [value for value in row[2:] if value is not None and normalize_text(value)]
+        if active_quarter and metric and values:
+            metric_rows += 1
+    return quarter_count >= 2 and metric_rows >= 4
+
+
+def _quarter_matrix_records(
+    doc: Document,
+    sheet_name: str,
+    rows: list[list[Any]],
+    header_rows: int,
+    headers: list[str],
+    table_name: str | None,
+) -> list[TableCellEvidence]:
+    records: list[TableCellEvidence] = []
+    period = _period_from_header(doc.title)
+    sheet_unit = _infer_unit(" ".join(headers), " ".join(normalize_text(value) for row in rows[:header_rows] for value in row if value))
+    active_quarter: str | None = None
+    for row_index, row in enumerate(rows[header_rows:], header_rows + 1):
+        quarter = _quarter_label(row[0] if len(row) > 0 else None)
+        if quarter:
+            active_quarter = quarter
+        indicator = normalize_text(row[1] if len(row) > 1 else None) or None
+        if not active_quarter or not indicator:
+            continue
+        for column_index, value in enumerate(row[2:], 3):
+            if value is None or normalize_text(value) == "":
+                continue
+            column_header = headers[column_index - 1] if column_index - 1 < len(headers) else None
+            column_header = column_header or None
+            normalized_value = normalize_text(value)
+            context = f"{indicator} | {active_quarter} | {column_header or ''} | {normalized_value}"
+            address = _excel_address(row_index, column_index)
+            records.append(
+                TableCellEvidence(
+                    evidence_id=f"cell:{doc.doc_id}:{sheet_name}:{address}",
+                    doc_id=doc.doc_id,
+                    sheet_name=sheet_name,
+                    table_name=table_name,
+                    indicator=indicator,
+                    period=period,
+                    value=_as_value(value),
+                    unit=_infer_unit(column_header, indicator) or sheet_unit,
+                    row_header=active_quarter,
+                    column_header=column_header,
+                    cell_address=address,
+                    context=normalize_text(context),
+                    source_url=doc.source_url,
+                )
+            )
+    return records
+
+
 def _cell_records(doc: Document, sheet_name: str, rows: list[list[Any]], table_name: str | None = None) -> list[TableCellEvidence]:
     records: list[TableCellEvidence] = []
     if not rows:
@@ -216,6 +308,8 @@ def _cell_records(doc: Document, sheet_name: str, rows: list[list[Any]], table_n
     for column in range(width):
         pieces = [normalize_text(rows[row][column]) for row in range(header_rows) if column < len(rows[row]) and normalize_text(rows[row][column])]
         headers.append(" / ".join(dict.fromkeys(pieces)))
+    if _looks_like_quarter_matrix(rows, header_rows):
+        return _quarter_matrix_records(doc, sheet_name, rows, header_rows, headers, table_name)
     for row_index, row in enumerate(rows, 1):
         row_header = first_nonempty(row[:2])
         indicator = row_header
@@ -225,9 +319,7 @@ def _cell_records(doc: Document, sheet_name: str, rows: list[list[Any]], table_n
             column_header = headers[column_index - 1] or None
             period = _period_from_header(column_header) or _period_from_header(doc.title)
             unit = None
-            unit_match = re.search(r"(%)|(%|‰|亿元|万元|百万元|元)", f"{column_header or ''} {row_header or ''}")
-            if unit_match:
-                unit = unit_match.group(1)
+            unit = _infer_unit(column_header, row_header)
             address = _excel_address(row_index, column_index)
             context = f"{indicator or ''} | {column_header or ''} | {normalize_text(value)}"
             records.append(

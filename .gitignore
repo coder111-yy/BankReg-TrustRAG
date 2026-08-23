@@ -9,6 +9,11 @@ __pycache__/
 **/__pycache__/
 .pytest_cache/
 *.py[cod]
+.coverage
+coverage.xml
+htmlcov/
+.mypy_cache/
+.ruff_cache/
 
 # 授权竞赛数据与本地数据目录
 03-*/
@@ -17,6 +22,13 @@ BankReg-TrustRAG_project/
 
 # 生成的知识库、模型、向量索引与评测产物
 artifacts/
+*.sqlite3
+*.db
+
+# 日志与本机 IDE 配置
+*.log
+.idea/
+.vscode/
 
 # 本地渲染、打包和系统文件
 _project_book_render*/

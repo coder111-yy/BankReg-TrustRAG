@@ -22,6 +22,14 @@ class Settings:
     bge_max_length: int = 512
     bge_local_files_only: bool = True
     bge_rerank_top_k: int = 32
+    llm_provider: str = "none"
+    llm_model: str | None = None
+    llm_base_url: str | None = None
+    llm_api_key: str | None = None
+    llm_timeout_seconds: float = 45.0
+    llm_max_tokens: int = 800
+    llm_temperature: float = 0.0
+    llm_max_context_chars: int = 12000
 
     @classmethod
     def from_env(cls, root: Path | None = None) -> "Settings":
@@ -72,4 +80,15 @@ class Settings:
             bge_max_length=int(os.getenv("BANKREG_BGE_MAX_LENGTH", "512")),
             bge_local_files_only=os.getenv("BANKREG_BGE_LOCAL_FILES_ONLY", "1").lower() in {"1", "true", "yes"},
             bge_rerank_top_k=int(os.getenv("BANKREG_BGE_RERANK_TOP_K", "32")),
+            llm_provider=os.getenv("BANKREG_LLM_PROVIDER", "none").strip().lower(),
+            llm_model=os.getenv("BANKREG_LLM_MODEL") or None,
+            llm_base_url=os.getenv("BANKREG_LLM_BASE_URL") or None,
+            # Keep the generic name as the canonical setting, while accepting
+            # DeepSeek's familiar name so an existing .env does not silently
+            # omit the Authorization header.
+            llm_api_key=os.getenv("BANKREG_LLM_API_KEY") or os.getenv("DEEPSEEK_API_KEY") or None,
+            llm_timeout_seconds=float(os.getenv("BANKREG_LLM_TIMEOUT_SECONDS", os.getenv("BANKREG_LLM_TIMEOUT", "45"))),
+            llm_max_tokens=int(os.getenv("BANKREG_LLM_MAX_TOKENS", "800")),
+            llm_temperature=float(os.getenv("BANKREG_LLM_TEMPERATURE", "0")),
+            llm_max_context_chars=int(os.getenv("BANKREG_LLM_MAX_CONTEXT_CHARS", os.getenv("BANKREG_CONTEXT_MAX_CHARS", "12000"))),
         )

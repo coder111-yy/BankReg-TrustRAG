@@ -30,6 +30,8 @@ Copy-Item .env.example .env
 
 无本地 BGE 模型时，将 `.env` 中的 `BANKREG_BGE_MODE` 改为 `auto`；有模型时，保持 `required` 并把模型放到 `BANKREG_BGE_CACHE_DIR` 指定目录。
 
+大模型生成功能默认关闭。如果使用本地或已获授权的 OpenAI-compatible 服务，可在 `.env` 中设置 `BANKREG_LLM_PROVIDER`、`BANKREG_LLM_MODEL` 和 `BANKREG_LLM_BASE_URL`；API Key 仅在服务确实需要时填写。模型回答会经过现有核验器，核验失败不会直接展示。
+
 导入授权数据并建立知识库：
 
 ```powershell

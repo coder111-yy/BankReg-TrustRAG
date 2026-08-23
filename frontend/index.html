@@ -68,6 +68,9 @@
     .empty-seal { display: grid; width: 46px; height: 46px; margin: 0 auto 10px; place-items: center; color: var(--teal); border: 1px solid #a8c9c0; border-radius: 50%; font-size: 20px; }
     .status { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; margin: 0 0 14px; }
     .badge { padding: 5px 10px; color: var(--teal-deep); background: var(--teal-soft); border-radius: 100px; font-size: 12px; font-weight: 800; }
+    .generation-badge { padding: 5px 10px; color: var(--muted); background: #edf1eb; border-radius: 100px; font-size: 12px; font-weight: 800; }
+    .generation-badge.ok { color: var(--teal-deep); background: var(--teal-soft); }
+    .generation-badge.warn { color: #8a5a1e; background: #f6ead4; }
     .decision { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
     .decision::before { width: 5px; height: 5px; content: ""; background: #69a77c; border-radius: 50%; }
     .decision.warn::before { background: var(--amber); }
@@ -76,6 +79,9 @@
     .trust-bar { width: 62px; height: 5px; overflow: hidden; background: #dfe5de; border-radius: 99px; }
     .trust-bar span { display: block; height: 100%; background: var(--teal); border-radius: inherit; }
     .answer { padding: 19px 21px; color: var(--ink); background: #fbfbf5; border: 1px solid #d9e0d8; border-left: 4px solid var(--amber); border-radius: 5px 13px 13px 5px; box-shadow: 0 7px 15px rgba(16, 37, 45, .04); font-size: 18px; line-height: 1.75; white-space: pre-wrap; }
+    .trace-details { margin: 14px 0 0; color: var(--muted-light); font-size: 11px; }
+    .trace-details summary { cursor: pointer; letter-spacing: .04em; }
+    .trace-details span { display: block; margin-top: 6px; overflow-wrap: anywhere; }
     .agent-note { margin-top: 13px; padding: 12px 14px; color: var(--muted); background: #f2f5ef; border: 1px solid #d9e0d8; border-radius: 8px; font-size: 12px; line-height: 1.6; }
     .agent-note strong { color: var(--ink); }
     .agent-options { display: grid; gap: 5px; margin-top: 7px; }
@@ -110,6 +116,7 @@
     .evidence::after { position: absolute; top: 22px; left: 0; width: 7px; height: 7px; content: ""; background: var(--amber); border: 3px solid var(--paper); border-radius: 50%; box-sizing: content-box; }
     .evidence h3 { margin: 0 0 7px; color: var(--ink-soft); font-size: 11px; letter-spacing: .12em; text-transform: uppercase; }
     .evidence code { display: block; max-width: 100%; color: var(--teal); font: 11px/1.45 "Cascadia Code", Consolas, monospace; overflow-wrap: anywhere; word-break: break-word; }
+    .evidence-id-details { margin-top: 9px; }
     .evidence-source { margin-top: 7px; color: var(--ink); font-size: 13px; font-weight: 800; overflow-wrap: anywhere; word-break: break-word; }
     .evidence-meta { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
     .evidence-pill { max-width: 100%; padding: 3px 7px; color: var(--muted); background: #edf1eb; border-radius: 5px; font-size: 11px; overflow-wrap: anywhere; word-break: break-word; }
@@ -202,7 +209,7 @@
 
       <aside class="panel evidence-panel" aria-labelledby="evidence-title">
         <div class="evidence-head"><div class="panel-heading"><div><p class="eyebrow">Source ledger</p><h2 id="evidence-title">证据链</h2></div><span class="panel-index">03 / PROOF</span></div><p class="evidence-lede">从原始文件到最小证据单元，记录每一步依据。</p></div>
-        <div id="evidence" class="ledger" aria-live="polite"><div class="empty-state"><div><div class="empty-seal" aria-hidden="true">⌑</div><div>尚未建立证据链</div><p class="muted">提交问题后显示 Evidence ID、源文件和单元格/段落位置。</p></div></div></div>
+        <div id="evidence" class="ledger" aria-live="polite"><div class="empty-state"><div><div class="empty-seal" aria-hidden="true">⌑</div><div>尚未建立证据链</div><p class="muted">提交问题后显示来源、指标和单元格/段落位置。</p></div></div></div>
       </aside>
     </div>
 
@@ -224,6 +231,7 @@
     const escapeHtml = value => String(value ?? '').replace(/[&<>\"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[char]));
     const readableValue = value => { if (value === null || value === undefined || value === '') return ''; if (typeof value !== 'string') return String(value); try { const parsed = JSON.parse(value); return typeof parsed === 'string' ? parsed : JSON.stringify(parsed); } catch { return value.replace(/^\"|\"$/g, ''); } };
     const shorten = (value, limit=260) => { const text = String(value ?? ''); return text.length > limit ? `${text.slice(0, limit)}…` : text; };
+    const compactSource = value => { let text = readableValue(value); text = text.replace(/^\d+_/, ''); const parts = text.split('_'); if (parts.length > 1 && parts[parts.length - 1] === parts[parts.length - 2]) parts.pop(); return shorten(text, 72); };
     const decisionClass = decision => decision === 'refuse' ? 'danger' : decision === 'clarify' ? 'warn' : '';
     const renderEvidence = (items, evidenceRoles = {}) => {
       const shown = items.slice(0, 4);
@@ -232,7 +240,7 @@
         const location = table ? `${e.sheet_name || e.table_name || '工作表'} · ${e.cell_address || '未标注单元格'}` : [e.page && `第${e.page}页`, e.paragraph_no && `段落${e.paragraph_no}`].filter(Boolean).join(' · ') || '未标注段落';
         const value = readableValue(e.value_text), summary = table ? [e.indicator && `指标：${e.indicator}`, e.period && `期间：${e.period}`, value && `值：${value}`, e.unit && `单位：${e.unit}`].filter(Boolean).join(' · ') : (e.content || e.context || ''), raw = e.context || e.content || e.column_header || '';
         const role = evidenceRoles[e.evidence_id], sourceLink = e.doc_id ? `<a class="source-link" href="/api/documents/${encodeURIComponent(e.doc_id)}/source" target="_blank" rel="noopener">打开原始文件 ↗</a>` : '';
-        return `<article class="evidence"><h3>证据 ${String(index + 1).padStart(2, '0')}</h3><code>${escapeHtml(e.evidence_id || '未标注证据')}</code><div class="evidence-source">${escapeHtml(source)}</div><div class="evidence-meta"><span class="evidence-pill">${escapeHtml(location)}</span>${role ? `<span class="evidence-pill">${escapeHtml(role)}</span>` : ''}${table && e.source_file_name ? `<span class="evidence-pill">${escapeHtml(e.source_file_name)}</span>` : ''}</div><div class="evidence-context">${escapeHtml(shorten(summary))}</div>${sourceLink}${raw ? `<details><summary>查看原始上下文</summary><div class="evidence-raw">${escapeHtml(raw)}</div></details>` : ''}</article>`;
+        return `<article class="evidence"><h3>证据 ${String(index + 1).padStart(2, '0')}</h3><div class="evidence-source">${escapeHtml(compactSource(source))}</div><div class="evidence-meta"><span class="evidence-pill">${escapeHtml(location)}</span>${role ? `<span class="evidence-pill">${escapeHtml(role)}</span>` : ''}</div><div class="evidence-context">${escapeHtml(shorten(summary))}</div>${sourceLink}<details class="evidence-id-details"><summary>查看证据标识</summary><code>${escapeHtml(e.evidence_id || '未标注证据')}</code></details>${raw ? `<details><summary>查看原始上下文</summary><div class="evidence-raw">${escapeHtml(raw)}</div></details>` : ''}</article>`;
       }).join('');
       const note = items.length > shown.length ? `<div class="ledger-note">已展示最相关的 ${shown.length} 条，共 ${items.length} 条。</div>` : '';
       return cards + note || '<div class="empty-state"><div><div class="empty-seal" aria-hidden="true">⌑</div><div>没有可展示证据</div></div></div>';
@@ -275,9 +283,9 @@
         const r = await fetch('/api/qa', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({question:q.value}) }), d = await r.json().catch(() => ({}));
         if (!r.ok) { const detail = Array.isArray(d.detail) ? d.detail.map(item => item.msg || item).join('；') : (d.detail || '服务端返回错误'); throw new Error(`HTTP ${r.status}：${detail}`); }
         if (!d || !d.trust || typeof d.trust.score !== 'number') throw new Error('接口返回格式异常：缺少 trust.score');
-        const agent = d.query_plan?.agent || {}, hitl = agent.human_in_loop || {}, qaTypeLabel = agent.intent === 'multiple_choice' ? '选择题' : (qaTypeLabels[d.qa_type] || d.qa_type || '问答'), decisionLabel = hitl.status === 'pending' ? '需要人工确认' : (decisionLabels[d.trust.decision] || d.trust.decision || '未判定'), score = Math.max(0, Math.min(1, Number(d.trust.score)));
+        const agent = d.query_plan?.agent || {}, hitl = agent.human_in_loop || {}, generation = d.query_plan?.generation || {}, generationStatus = generation.status || 'disabled', generationLabel = generationStatus === 'accepted' ? 'AI 已生成并通过核验' : generationStatus === 'error' || generationStatus === 'rejected_by_verification' ? 'AI 未通过核验，已回退' : '本地确定性回答', generationClass = generationStatus === 'accepted' ? 'ok' : generationStatus === 'error' || generationStatus === 'rejected_by_verification' ? 'warn' : '', qaTypeLabel = agent.intent === 'multiple_choice' ? '选择题' : (qaTypeLabels[d.qa_type] || d.qa_type || '问答'), decisionLabel = hitl.status === 'pending' ? '需要人工确认' : (decisionLabels[d.trust.decision] || d.trust.decision || '未判定'), score = Math.max(0, Math.min(1, Number(d.trust.score))), trustPercent = Math.round(score * 100);
         const workflow = d.query_plan?.agent_workflow || {}, evidenceRoles = Object.fromEntries((workflow.evidence_organization?.items || []).map(item => [item.evidence_id, item.role]));
-        result.innerHTML = `<div class="status"><span class="badge">${escapeHtml(qaTypeLabel)}</span><span class="decision ${decisionClass(d.trust.decision)}">${escapeHtml(decisionLabel)}</span><span class="trust-meter">信任分 ${escapeHtml(d.trust.score)}<span class="trust-bar"><span style="width:${score * 100}%"></span></span><span>${escapeHtml(d.latency_ms)} ms</span></span></div><div class="answer"></div>${renderAgentNote(agent)}${renderAgentWorkflow(workflow)}<p class="trace">TRACE / ${escapeHtml(d.trace_id)}</p>`;
+        result.innerHTML = `<div class="status"><span class="badge">${escapeHtml(qaTypeLabel)}</span><span class="decision ${decisionClass(d.trust.decision)}">${escapeHtml(decisionLabel)}</span><span class="generation-badge ${generationClass}">${generationLabel}</span><span class="trust-meter">可信度 ${trustPercent}%<span class="trust-bar"><span style="width:${score * 100}%"></span></span></span></div><div class="answer"></div>${renderAgentNote(agent)}${renderAgentWorkflow(workflow)}<details class="trace-details"><summary>查看处理详情</summary><span>追踪编号：${escapeHtml(d.trace_id)} · 耗时：${escapeHtml(d.latency_ms)} ms</span></details>`;
         result.querySelector('.answer').textContent = d.answer; evidence.innerHTML = renderEvidence(d.evidence || [], evidenceRoles);
       } catch (error) {
         result.innerHTML = `<div class="empty-state"><div><div class="empty-seal" aria-hidden="true">!</div><div>请求未完成</div><p class="muted">${escapeHtml(error instanceof Error ? error.message : String(error))}</p></div></div>`;
