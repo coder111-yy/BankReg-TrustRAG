@@ -4,7 +4,7 @@ import time
 import uuid
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .agent import build_agent_workflow, identify_intent, organize_evidence, run_choice_agent
 from .config import Settings
@@ -45,17 +45,36 @@ class TrustRAGService:
         self.store.load_jsonl(self.settings.artifact_dir)
         self.index = HybridIndex.from_store(self.store, semantic=self.semantic, vector_dir=self.settings.bge_vector_dir)
 
-    def ask(self, question: str, choices: list[str] | None = None, qa_type: str | None = None, filters: dict[str, Any] | None = None) -> QAResponse:
+    def ask(
+        self,
+        question: str,
+        choices: list[str] | None = None,
+        qa_type: str | None = None,
+        filters: dict[str, Any] | None = None,
+        conversation_context: list[dict[str, Any]] | None = None,
+        observer: Callable[[str, dict[str, Any]], None] | None = None,
+    ) -> QAResponse:
         started = time.perf_counter()
+        def report(stage: str, **details: Any) -> None:
+            if observer is not None:
+                observer(stage, {"elapsed_ms": int((time.perf_counter() - started) * 1000), **details})
+
+        report("understanding", label="正在理解问题与识别查询类型")
         question_for_retrieval, inline_choices = extract_inline_choices(question)
         effective_choices = [str(value).strip() for value in (choices or inline_choices) if str(value).strip()]
-        parsed = parse_query(question_for_retrieval, effective_choices)
+        question_for_analysis = _question_with_conversation_context(question_for_retrieval, conversation_context)
+        parsed = parse_query(question_for_analysis, effective_choices)
+        # Keep the actual user message as the auditable original query.  The
+        # contextual form is used only to resolve follow-up references during
+        # routing/retrieval; it is never promoted to regulatory evidence.
+        parsed.original_query = question
         if qa_type:
             parsed.qa_type = qa_type  # type: ignore[assignment]
         # A multiple-choice stem may be generic while the regulatory domain
         # anchor appears only inside an option (for example, “商业银行不得…”).
-        scope = classify_question_scope(" ".join([question_for_retrieval, *effective_choices]))
+        scope = classify_question_scope(" ".join([question_for_analysis, *effective_choices]))
         if not scope["in_scope"]:
+            report("scope_guard", label="问题不在银行监管知识库范围内")
             return self._refuse_out_of_scope(
                 question,
                 question_for_retrieval,
@@ -88,7 +107,7 @@ class TrustRAGService:
                 if known_names and not any(str(value).lower() in name.lower() for value in requested_files for name in known_names):
                     filters.pop("file_name", None)
         agent_workflow = build_agent_workflow(parsed, question_for_retrieval, effective_choices, filters)
-        retrieval_query = question_for_retrieval
+        retrieval_query = question_for_analysis
         retrieval_anchors = [
             parsed.entities.get("indicator"),
             parsed.entities.get("table_name"),
@@ -101,6 +120,7 @@ class TrustRAGService:
         # Options are intentionally not concatenated into this base query.  The
         # choice agent below retrieves each option independently.
         retrieval_k = max(self.settings.top_k, 32) if parsed.requires_table else self.settings.top_k
+        report("retrieving", label="正在检索本地制度与统计资料", routes=["bm25", "metadata", "bge_vector"])
         if parsed.qa_type == "cross_file_judgment":
             # Cross-file questions have two independent scopes.  The named
             # workbook constrains the structured/statistical hop, but must not
@@ -137,6 +157,7 @@ class TrustRAGService:
             hits = self.index.hybrid_search(retrieval_query, parsed.qa_type, retrieval_k, filters)
         choice_result = None
         if len(effective_choices) >= 2:
+            report("choice_retrieval", label="正在分别核对每个选项的证据")
             choice_result = run_choice_agent(
                 self.index,
                 retrieval_query,
@@ -147,6 +168,12 @@ class TrustRAGService:
             )
             hits = _merge_hits(hits, choice_result.all_hits)
         _enrich_hits(self.index, hits)
+        report(
+            "evidence_selected",
+            label="已完成重排并筛选最小证据集",
+            documents=_retrieved_document_labels(hits),
+            evidence_count=len(hits),
+        )
         missing_year = _requested_year_missing(parsed.entities.get("years", []), hits)
         if missing_year:
             draft = AnswerDraft(
@@ -155,6 +182,7 @@ class TrustRAGService:
                 [{"type": "refusal", "source": None, "reason": f"知识库缺少{missing_year}年证据"}],
             )
         else:
+            report("reasoning", label="正在依据证据执行规则匹配与确定性计算")
             if choice_result is not None:
                 draft = _choice_answer_draft(choice_result)
             else:
@@ -163,6 +191,7 @@ class TrustRAGService:
         if choice_result is None and hits and not _has_terminal_operation(draft.operations):
             generator = getattr(self, "generator", None)
             if generator is not None and generator.enabled:
+                report("generating", label="正在基于已检索证据生成回答")
                 context_hits = _minimal_display_hits(hits, draft.operations, None)
                 generated = generator.generate(question_for_retrieval, parsed, context_hits, draft.operations)
                 llm_generation = {
@@ -196,6 +225,7 @@ class TrustRAGService:
                         draft.operations.append(generation_operation)
                 else:
                     draft.operations.append(generation_operation)
+        report("verifying", label="正在核验数值、实体、版本与证据支持")
         verification = verify_claims(draft.answer, question, hits, draft.claims)
         retry_record: dict[str, Any] | None = None
         if _should_retry_verification(verification, draft, choice_result, missing_year):
@@ -306,6 +336,7 @@ class TrustRAGService:
         plan["agent_workflow"] = agent_workflow
         response = QAResponse(draft.answer, parsed.qa_type, evidence, verification.to_dict(), trust, trace_id, latency, plan)
         self.store.save_qa(trace_id, question, parsed.qa_type, plan, [hit.evidence_id for hit in hits], draft.answer, trust["score"], verification.to_dict(), trust["decision"], latency)
+        report("completed", label="回答与证据链已完成", latency_ms=latency)
         return response
 
     def _refuse_out_of_scope(
@@ -418,6 +449,39 @@ def _requested_year_missing(years: list[str], hits: list[Any]) -> str | None:
     )
     missing = [year for year in years if year not in evidence]
     return missing[0] if missing else None
+
+
+def _question_with_conversation_context(question: str, messages: list[dict[str, Any]] | None) -> str:
+    """Add a bounded user-question-only hint for a conversational follow-up.
+
+    Assistant answers are deliberately excluded: their prose is not source
+    material.  The hint only helps recover omitted entities such as an
+    indicator or table name; normal evidence retrieval still determines every
+    answer.
+    """
+    prior_questions = [
+        str(message.get("content") or "").strip()
+        for message in (messages or [])
+        if message.get("role") == "user" and str(message.get("content") or "").strip()
+    ][-3:]
+    if not prior_questions:
+        return question
+    history = "\n".join(f"历史问题：{item[:360]}" for item in prior_questions)
+    return f"{history}\n当前问题：{question}"
+
+
+def _retrieved_document_labels(hits: list[Any], limit: int = 6) -> list[str]:
+    labels: list[str] = []
+    for hit in hits:
+        item = getattr(hit, "item", {})
+        label = item.get("source_title") or item.get("source_file_name") or item.get("title") or item.get("file_name")
+        if label:
+            compact = _compact_source_title(label) or str(label)
+            if compact not in labels:
+                labels.append(compact[:100])
+        if len(labels) >= limit:
+            break
+    return labels
 
 
 def _compact_source_title(title: Any) -> str | None:

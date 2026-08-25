@@ -31,6 +31,25 @@ CREATE TABLE IF NOT EXISTS qa_records (
   query_plan_json TEXT, evidence_ids_json TEXT, answer TEXT, confidence REAL,
   verification_json TEXT, decision TEXT, latency_ms INTEGER, created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
+CREATE TABLE IF NOT EXISTS conversations (
+  conversation_id TEXT PRIMARY KEY, memory_scope_id TEXT NOT NULL,
+  title TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS conversation_messages (
+  message_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL,
+  role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
+  content TEXT NOT NULL, trace_id TEXT, metadata_json TEXT,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY(conversation_id) REFERENCES conversations(conversation_id)
+);
+CREATE TABLE IF NOT EXISTS long_term_memories (
+  memory_id TEXT PRIMARY KEY, memory_scope_id TEXT NOT NULL,
+  conversation_id TEXT NOT NULL, question TEXT NOT NULL, answer TEXT NOT NULL,
+  qa_type TEXT, decision TEXT NOT NULL, evidence_ids_json TEXT,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY(conversation_id) REFERENCES conversations(conversation_id)
+);
 CREATE TABLE IF NOT EXISTS document_relations (
   source_doc_id TEXT NOT NULL, target_doc_id TEXT NOT NULL, relation_type TEXT NOT NULL,
   confidence REAL NOT NULL, rationale TEXT, PRIMARY KEY(source_doc_id, target_doc_id, relation_type),
@@ -43,6 +62,9 @@ CREATE INDEX IF NOT EXISTS idx_table_indicator ON table_evidence(indicator);
 CREATE INDEX IF NOT EXISTS idx_table_period ON table_evidence(period);
 CREATE INDEX IF NOT EXISTS idx_relation_source ON document_relations(source_doc_id);
 CREATE INDEX IF NOT EXISTS idx_relation_target ON document_relations(target_doc_id);
+CREATE INDEX IF NOT EXISTS idx_conversation_scope ON conversations(memory_scope_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_message_conversation ON conversation_messages(conversation_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_memory_scope ON long_term_memories(memory_scope_id, created_at DESC);
 """
 
 
@@ -264,6 +286,150 @@ class Store:
         rows = self.connection.execute("SELECT * FROM qa_records ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
         return [dict(row) for row in rows]
 
+    def create_conversation(self, conversation_id: str, memory_scope_id: str, title: str = "新对话") -> dict[str, Any]:
+        """Create one browser-scoped conversation without mixing local users."""
+        with self.connection:
+            self.connection.execute(
+                "INSERT INTO conversations(conversation_id,memory_scope_id,title) VALUES (?,?,?)",
+                (conversation_id, memory_scope_id, title.strip()[:80] or "新对话"),
+            )
+        return self.get_conversation(conversation_id, memory_scope_id) or {}
+
+    def get_conversation(self, conversation_id: str, memory_scope_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            "SELECT * FROM conversations WHERE conversation_id=? AND memory_scope_id=?",
+            (conversation_id, memory_scope_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def update_conversation_title(self, conversation_id: str, memory_scope_id: str, title: str) -> None:
+        with self.connection:
+            self.connection.execute(
+                "UPDATE conversations SET title=?, updated_at=CURRENT_TIMESTAMP WHERE conversation_id=? AND memory_scope_id=?",
+                (title.strip()[:80] or "新对话", conversation_id, memory_scope_id),
+            )
+
+    def list_conversations(self, memory_scope_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            """SELECT c.conversation_id, c.title, c.created_at, c.updated_at,
+                      COUNT(m.message_id) AS message_count
+               FROM conversations c
+               LEFT JOIN conversation_messages m ON m.conversation_id=c.conversation_id
+               WHERE c.memory_scope_id=?
+               GROUP BY c.conversation_id
+               ORDER BY c.updated_at DESC
+               LIMIT ?""",
+            (memory_scope_id, max(1, min(int(limit), 100))),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def conversation_messages(self, conversation_id: str, memory_scope_id: str, limit: int = 100) -> list[dict[str, Any]]:
+        if not self.get_conversation(conversation_id, memory_scope_id):
+            return []
+        rows = self.connection.execute(
+            """SELECT message_id, role, content, trace_id, metadata_json, created_at
+               FROM conversation_messages WHERE conversation_id=?
+               ORDER BY created_at, rowid LIMIT ?""",
+            (conversation_id, max(1, min(int(limit), 200))),
+        ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["metadata"] = json.loads(item.pop("metadata_json") or "{}")
+            except json.JSONDecodeError:
+                item["metadata"] = {}
+            result.append(item)
+        return result
+
+    def recent_conversation_messages(self, conversation_id: str, memory_scope_id: str, limit: int = 8) -> list[dict[str, Any]]:
+        messages = self.conversation_messages(conversation_id, memory_scope_id, limit=200)
+        return messages[-max(1, min(int(limit), 20)):]
+
+    def add_conversation_message(
+        self,
+        message_id: str,
+        conversation_id: str,
+        memory_scope_id: str,
+        role: str,
+        content: str,
+        *,
+        trace_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        if role not in {"user", "assistant"}:
+            raise ValueError("unsupported conversation role")
+        if not self.get_conversation(conversation_id, memory_scope_id):
+            raise ValueError("conversation not found")
+        with self.connection:
+            self.connection.execute(
+                """INSERT INTO conversation_messages(message_id,conversation_id,role,content,trace_id,metadata_json)
+                   VALUES (?,?,?,?,?,?)""",
+                (message_id, conversation_id, role, content, trace_id, json.dumps(metadata or {}, ensure_ascii=False)),
+            )
+            self.connection.execute(
+                "UPDATE conversations SET updated_at=CURRENT_TIMESTAMP WHERE conversation_id=?",
+                (conversation_id,),
+            )
+
+    def remember_answer(
+        self,
+        memory_id: str,
+        memory_scope_id: str,
+        conversation_id: str,
+        question: str,
+        answer: str,
+        qa_type: str,
+        decision: str,
+        evidence_ids: list[str],
+    ) -> None:
+        """Persist only an answered, traceable exchange for cross-session recall.
+
+        Long-term records are conversation aids, never evidence for a future
+        regulatory conclusion.  Each later answer still goes through normal
+        document retrieval and verification.
+        """
+        if decision != "answer" or not answer.strip():
+            return
+        with self.connection:
+            self.connection.execute(
+                """INSERT INTO long_term_memories(memory_id,memory_scope_id,conversation_id,question,answer,qa_type,decision,evidence_ids_json)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (
+                    memory_id, memory_scope_id, conversation_id, question.strip()[:1200], answer.strip()[:2400],
+                    qa_type, decision, json.dumps(evidence_ids[:12], ensure_ascii=False),
+                ),
+            )
+
+    def recall_memories(
+        self,
+        memory_scope_id: str,
+        query: str,
+        *,
+        exclude_conversation_id: str | None = None,
+        limit: int = 4,
+    ) -> list[dict[str, Any]]:
+        """Lexically recall related answered exchanges without treating them as sources."""
+        clauses = ["memory_scope_id=?", "decision='answer'"]
+        params: list[Any] = [memory_scope_id]
+        if exclude_conversation_id:
+            clauses.append("conversation_id<>?")
+            params.append(exclude_conversation_id)
+        rows = self.connection.execute(
+            f"SELECT * FROM long_term_memories WHERE {' AND '.join(clauses)} ORDER BY created_at DESC LIMIT 120",
+            params,
+        ).fetchall()
+        query_tokens = _memory_tokens(query)
+        ranked: list[tuple[float, dict[str, Any]]] = []
+        for row in rows:
+            item = dict(row)
+            overlap = len(query_tokens.intersection(_memory_tokens(f"{item['question']} {item['answer']}")))
+            if overlap:
+                item["relevance"] = round(overlap / max(len(query_tokens), 1), 4)
+                ranked.append((float(item["relevance"]), item))
+        ranked.sort(key=lambda pair: (pair[0], pair[1]["created_at"]), reverse=True)
+        return [item for _, item in ranked[:max(1, min(int(limit), 8))]]
+
     def save_qa(self, trace_id: str, question: str, qa_type: str, query_plan: dict[str, Any], evidence_ids: list[str], answer: str, confidence: float, verification: dict[str, Any], decision: str, latency_ms: int) -> None:
         with self.connection:
             self.connection.execute(
@@ -281,3 +447,12 @@ def _read_jsonl(path: Path) -> Iterable[dict[str, Any]]:
                 if line.strip():
                     yield json.loads(line)
     return generator()
+
+
+def _memory_tokens(value: str) -> set[str]:
+    """Small deterministic tokenizer suitable for local-memory ranking."""
+    compact = "".join(char.lower() if char.isalnum() or '\u4e00' <= char <= '\u9fff' else " " for char in str(value))
+    terms = {term for term in compact.split() if len(term) > 1}
+    chinese = "".join(char for char in compact if '\u4e00' <= char <= '\u9fff')
+    terms.update(chinese[index:index + 2] for index in range(max(0, len(chinese) - 1)))
+    return terms
