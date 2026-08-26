@@ -10,6 +10,10 @@ from typing import Any, Iterable
 _TABLE_OUTLINE_PREFIX_RE = re.compile(
     r"^(?:\((?:\d+|[一二三四五六七八九十百]+)\)[、.．:：]?|(?:\d+|[一二三四五六七八九十百]+)[)、.．:：](?!\d))"
 )
+_TABLE_HIERARCHY_PREFIX_RE = re.compile(
+    r"^(?:(?:其中(?:包括|含)?|包括)[、,:：，]?)+",
+    re.IGNORECASE,
+)
 
 
 def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
@@ -45,7 +49,82 @@ def canonical_table_label(value: Any) -> str:
     """
     label = re.sub(r"\s+", "", normalize_text(value)).lower()
     label = _TABLE_OUTLINE_PREFIX_RE.sub("", label, count=1)
+    label = _TABLE_HIERARCHY_PREFIX_RE.sub("", label, count=1)
     return label.replace("总计", "合计")
+
+
+def canonical_dimension_label(value: Any) -> str:
+    """Normalize equivalent separators in hierarchical column labels."""
+    return re.sub(r"[/／\\|｜_\-—–]+", "", canonical_table_label(value))
+
+
+def insurance_company_scope(value: Any) -> str | None:
+    """Return the explicit insurance-company section named by text."""
+    text = re.sub(r"\s+", "", normalize_text(value))
+    if re.search(r"(?:财产保险|财产险|产险)公司", text):
+        return "财产保险公司"
+    if re.search(r"(?:人身保险|人身险|寿险)公司", text):
+        return "人身险公司"
+    if any(term in text for term in ("保险业总体", "保险业整体", "保险行业总体", "全保险业", "全部保险公司", "保险业合计")):
+        return "保险业总体"
+    return None
+
+
+def is_insurance_fund_table(*values: Any) -> bool:
+    """Identify insurance-fund-use reports that contain repeated sections."""
+    text = normalize_text(" ".join(str(value or "") for value in values))
+    return "保险" in text and "资金运用" in text
+
+
+_QUARTER_NUMBER = {
+    "一": 1,
+    "二": 2,
+    "三": 3,
+    "四": 4,
+    "1": 1,
+    "2": 2,
+    "3": 3,
+    "4": 4,
+}
+
+
+def reporting_period_details(value: Any) -> tuple[str | None, str | None, str | None]:
+    """Parse a reporting month/quarter/year from natural-language metadata.
+
+    Returns the matched display text, a sortable normalized value such as
+    ``2023-Q4`` or ``2023-09``, and a Chinese quarter label when applicable.
+    Quarter metadata is intentionally read from document titles as well as
+    questions because some source workbooks contain stale worksheet names.
+    """
+    text = normalize_text(value)
+    month_match = re.search(r"(20\d{2})年\s*0?(1[0-2]|[1-9])月", text)
+    if month_match:
+        year = int(month_match.group(1))
+        month = int(month_match.group(2))
+        quarter = ("一季度", "二季度", "三季度", "四季度")[(month - 1) // 3]
+        return month_match.group(0), f"{year:04d}-{month:02d}", quarter
+
+    quarter_match = re.search(
+        r"(20\d{2})年\s*(?:第\s*)?([一二三四1-4])\s*季度",
+        text,
+    )
+    if not quarter_match:
+        quarter_match = re.search(r"(20\d{2})\s*[-_/]?\s*[Qq]([1-4])", text)
+    if quarter_match:
+        year = int(quarter_match.group(1))
+        quarter_number = _QUARTER_NUMBER[quarter_match.group(2)]
+        quarter_label = ("一季度", "二季度", "三季度", "四季度")[quarter_number - 1]
+        return quarter_match.group(0), f"{year:04d}-Q{quarter_number}", quarter_label
+
+    year_match = re.search(r"(20\d{2})年", text)
+    if year_match:
+        return year_match.group(0), year_match.group(1), None
+    return None, None, None
+
+
+def normalized_reporting_period(value: Any) -> str | None:
+    """Return only the canonical reporting-period key for ``value``."""
+    return reporting_period_details(value)[1]
 
 
 def tokens(text: str) -> list[str]:

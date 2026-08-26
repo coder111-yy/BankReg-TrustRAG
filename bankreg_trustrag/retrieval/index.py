@@ -9,7 +9,18 @@ from typing import Any, Iterable
 
 from ..schemas import TableCellEvidence, TextEvidence
 from ..query import extract_dimension_labels, extract_indicator
-from ..utils import canonical_table_label, char_ngrams, normalize_text, normalized_number, tokens
+from ..utils import (
+    canonical_dimension_label,
+    canonical_table_label,
+    char_ngrams,
+    insurance_company_scope,
+    is_insurance_fund_table,
+    normalize_text,
+    normalized_reporting_period,
+    normalized_number,
+    reporting_period_details,
+    tokens,
+)
 from .bge import BGEPipeline, PersistentVectorIndex
 
 
@@ -84,7 +95,34 @@ class HybridIndex:
         self._formula_indices: list[int] = []
         for index, item in enumerate(self.text):
             self._text_indices_by_doc[str(item.get("doc_id"))].append(index)
+        active_insurance_scopes: dict[tuple[str, str], str] = {}
         for index, item in enumerate(self.tables):
+            doc_id = str(item.get("doc_id"))
+            sheet_name = str(item.get("sheet_name") or item.get("table_name") or "")
+            document = self.doc_by_id.get(doc_id, {})
+            document_period = normalized_reporting_period(" ".join(
+                str(document.get(key) or "")
+                for key in ("title", "file_name", "local_path")
+            ))
+            if document_period:
+                item["_document_period"] = document_period
+            if is_insurance_fund_table(
+                document.get("title"),
+                document.get("file_name"),
+                sheet_name,
+                item.get("table_name"),
+            ):
+                scope_key = (doc_id, sheet_name)
+                heading_scope = insurance_company_scope(" ".join(
+                    str(item.get(key) or "") for key in ("indicator", "row_header", "value_text")
+                ))
+                if heading_scope:
+                    active_insurance_scopes[scope_key] = heading_scope
+                section_scope = active_insurance_scopes.get(scope_key, "保险业总体")
+                item["_section_scope"] = section_scope
+                context = normalize_text(item.get("context"))
+                if section_scope not in context:
+                    item["context"] = f"{section_scope} | {context}" if context else section_scope
             self._table_indices_by_doc[str(item.get("doc_id"))].append(index)
             period = str(item.get("period") or "")
             if period:
@@ -138,7 +176,7 @@ class HybridIndex:
 
     @staticmethod
     def _table_blob(item: dict[str, Any]) -> str:
-        return " ".join(str(item.get(k) or "") for k in ["table_name", "indicator", "period", "unit", "row_header", "column_header", "context", "value_text"])
+        return " ".join(str(item.get(k) or "") for k in ["table_name", "_section_scope", "indicator", "period", "unit", "row_header", "column_header", "context", "value_text"])
 
     @staticmethod
     def _table_lexical(query_tokens: list[str], item: dict[str, Any]) -> float:
@@ -262,7 +300,8 @@ class HybridIndex:
         normalized_indicator = normalize_text(requested_indicator).lower() if requested_indicator else None
         requested_row, requested_column = extract_dimension_labels(query)
         normalized_row = _canonical_label(requested_row)
-        normalized_column = _canonical_label(requested_column)
+        normalized_column = canonical_dimension_label(requested_column)
+        requested_scope = insurance_company_scope(query)
         calculation_columns = _calculation_columns(query)
         is_calculation = len(calculation_columns) >= 2
 
@@ -270,8 +309,21 @@ class HybridIndex:
         # scoring avoids repeatedly computing similarity over the full million-cell
         # corpus for ordinary period-specific questions.
         period_match = re.search(r"(20\d{2})年\s*0?(\d{1,2})月", normalize_text(query))
-        requested_quarter: str | None = None
-        if period_match:
+        _, requested_document_period, requested_quarter = reporting_period_details(query)
+        if requested_document_period and re.fullmatch(r"20\d{2}-Q[1-4]", requested_document_period):
+            # Separate quarterly workbooks often persist only the year in each
+            # cell's ``period`` field.  Their document title retains the actual
+            # quarter and is authoritative even when the worksheet tab is stale.
+            quarter_document_indices = [
+                index for index in candidate_indices
+                if re.fullmatch(r"20\d{2}-Q[1-4]", str(self.tables[index].get("_document_period") or ""))
+            ]
+            if quarter_document_indices:
+                candidate_indices = [
+                    index for index in quarter_document_indices
+                    if self.tables[index].get("_document_period") == requested_document_period
+                ]
+        elif period_match:
             year = int(period_match.group(1))
             month = int(period_match.group(2))
             requested_period = f"{year:04d}-{month:02d}"
@@ -314,6 +366,17 @@ class HybridIndex:
             if row_indices:
                 candidate_indices = row_indices
 
+        scoped_indices = [
+            index for index in candidate_indices
+            if self.tables[index].get("_section_scope")
+        ]
+        if scoped_indices and (requested_scope or normalized_row or normalized_indicator):
+            target_scope = requested_scope or "保险业总体"
+            candidate_indices = [
+                index for index in scoped_indices
+                if self.tables[index].get("_section_scope") == target_scope
+            ]
+
         # For a difference/change question, the two operands must survive the
         # shortlist together.  Applying the normal single-column filter here
         # keeps only the first column and makes the reasoning stage fall back
@@ -321,7 +384,7 @@ class HybridIndex:
         if normalized_column and not is_calculation:
             column_indices = [
                 index for index in candidate_indices
-                if normalized_column in _canonical_label(" ".join(
+                if normalized_column in canonical_dimension_label(" ".join(
                     str(self.tables[index].get(key) or "")
                     for key in ["column_header", "period"]
                 ))
@@ -363,15 +426,15 @@ class HybridIndex:
             }:
                 table_score += 3.0
 
-            if normalized_column and normalized_column in _canonical_label(" ".join(
+            if normalized_column and normalized_column in canonical_dimension_label(" ".join(
                 str(item.get(key) or "") for key in ["column_header", "period"]
             )):
                 table_score += 3.0
             if is_calculation:
-                column_context = _canonical_label(" ".join(
+                column_context = canonical_dimension_label(" ".join(
                     str(item.get(key) or "") for key in ["column_header", "context", "period"]
                 ))
-                if any(_canonical_label(column) in column_context for column in calculation_columns):
+                if any(canonical_dimension_label(column) in column_context for column in calculation_columns):
                     table_score += 4.0
 
             if requested_quarter:
@@ -517,7 +580,7 @@ class HybridIndex:
     def _hit_blob(hit: Hit) -> str:
         item = hit.item
         return " ".join(str(item.get(k) or "") for k in [
-            "content", "context", "indicator", "period", "unit",
+            "content", "context", "_section_scope", "indicator", "period", "unit",
             "row_header", "column_header", "value_text", "chapter", "article_no",
         ])
 

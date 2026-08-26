@@ -4,7 +4,7 @@ import re
 from typing import Any
 
 from .schemas import ParsedQuery
-from .utils import normalize_text
+from .utils import insurance_company_scope, normalize_text, reporting_period_details
 
 
 # These are high-value structured-table indicators.  Keeping the longest terms
@@ -15,6 +15,7 @@ KNOWN_INDICATORS = (
     "拨备覆盖率",
     "贷款拨备率",
     "原保险保费收入",
+    "资金运用余额",
     "正常类贷款占比",
     "关注类贷款占比",
     "净息差",
@@ -35,6 +36,7 @@ KNOWN_TABLE_NAMES = (
     "银行业金融机构资产负债情况表",
     "银行业总资产、总负债",
     "保险业经营情况表",
+    "保险业资金运用情况表",
     "财产保险公司经营情况表",
     "人身险公司经营情况表",
     "全国各地区原保险保费收入情况表",
@@ -232,14 +234,7 @@ def extract_title_hints(text: str) -> list[str]:
 
 def period_details(text: str) -> tuple[str | None, str | None, str | None]:
     """Return display period, normalized month, and quarter label."""
-    normalized = normalize_text(text)
-    match = re.search(r"(20\d{2})年\s*(\d{1,2})月", normalized)
-    if not match:
-        return None, None, None
-    year = int(match.group(1))
-    month = int(match.group(2))
-    quarter = ("一季度", "二季度", "三季度", "四季度")[(month - 1) // 3] if 1 <= month <= 12 else None
-    return match.group(0), f"{year:04d}-{month:02d}", quarter
+    return reporting_period_details(text)
 
 
 def parse_query(question: str, choices: list[str] | None = None) -> ParsedQuery:
@@ -254,14 +249,13 @@ def parse_query(question: str, choices: list[str] | None = None) -> ParsedQuery:
     if _contains(text, ("第", "条", "比例", "不得", "应当", "可以", "期限", "阈值", "上限", "下限")) and qa_type == "regulatory_fact":
         qa_type = "clause_threshold"
     entities: dict[str, Any] = {}
-    dates = re.findall(r"20\d{2}(?:年\s*\d{1,2}月)?", text)
-    if dates:
-        entities["period"] = dates[0]
-        _, normalized_period, quarter = period_details(text)
-        if normalized_period:
-            entities["period_normalized"] = normalized_period
-        if quarter:
-            entities["quarter"] = quarter
+    display_period, normalized_period, quarter = period_details(text)
+    if display_period:
+        entities["period"] = display_period
+    if normalized_period:
+        entities["period_normalized"] = normalized_period
+    if quarter:
+        entities["quarter"] = quarter
     years = sorted(set(re.findall(r"(?<!\d)\d{1,4}(?=年)", text)), key=lambda value: int(value))
     if years:
         entities["years"] = years
@@ -280,6 +274,9 @@ def parse_query(question: str, choices: list[str] | None = None) -> ParsedQuery:
     institution_type = next((value for value in ("商业银行", "银行业金融机构", "保险公司", "保险业") if value in text), None)
     if institution_type:
         entities["institution_type"] = institution_type
+    company_scope = insurance_company_scope(text)
+    if company_scope:
+        entities["insurance_company_scope"] = company_scope
     row_label, column_label = extract_dimension_labels(text)
     if row_label:
         entities["row_label"] = row_label

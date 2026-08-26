@@ -7,7 +7,14 @@ from typing import Any
 
 from .query import extract_dimension_labels, extract_indicator
 from .retrieval.index import Hit
-from .utils import normalize_text, normalized_number, tokens
+from .utils import (
+    canonical_dimension_label,
+    canonical_table_label,
+    insurance_company_scope,
+    normalize_text,
+    normalized_number,
+    tokens,
+)
 
 
 @dataclass
@@ -329,8 +336,14 @@ def _numeric_match_score(
         _canonical_label(item.get("row_header")),
     }:
         score += 80.0
-    if requested_column and _canonical_label(requested_column) in _canonical_label(column_context):
+    if requested_column and canonical_dimension_label(requested_column) in canonical_dimension_label(column_context):
         score += 70.0
+    requested_scope = insurance_company_scope(question)
+    hit_scope = item.get("_section_scope") or insurance_company_scope(item.get("context"))
+    if requested_scope:
+        score += 120.0 if hit_scope == requested_scope else -120.0
+    elif hit_scope == "保险业总体":
+        score += 60.0
     score += 10.0 * hit.table_score + hit.rerank_score + hit.lexical_score * 0.01
     return score
 
@@ -398,10 +411,10 @@ def _calculation_answer(question: str, hits: list[Hit]) -> AnswerDraft | None:
             candidates = row_hits
     operands: list[tuple[str, Hit]] = []
     for column in columns:
-        column_key = _canonical_label(column)
+        column_key = canonical_dimension_label(column)
         matches = [
             hit for hit in candidates
-            if column_key in _canonical_label(" ".join(
+            if column_key in canonical_dimension_label(" ".join(
                 str(hit.item.get(key) or "") for key in ["column_header", "context", "period"]
             ))
             and _table_numeric_value(_load_table_value(hit.item.get("value_text"))) is not None
@@ -589,7 +602,9 @@ def table_answer(question: str, choices: list[str] | None, hits: list[Hit]) -> A
         match = re.fullmatch(r"(20\d{2})-(\d{2})", requested_period)
         period = f"{match.group(1)}年{int(match.group(2))}月" if match else requested_period
     if requested_row and requested_column:
-        answer = f"“{requested_row}”在“{requested_column}”口径下、{period}的数值为 {display_value}。"
+        section_scope = top.get("_section_scope") or insurance_company_scope(top.get("context"))
+        scope_prefix = f"{section_scope}的" if section_scope else ""
+        answer = f"{scope_prefix}“{requested_row}”在“{requested_column}”口径下、{period}的数值为 {display_value}。"
     else:
         answer = f"{top.get('indicator') or '该指标'}在{period}的值为 {display_value}。"
     operation = {
@@ -605,11 +620,14 @@ def table_answer(question: str, choices: list[str] | None, hits: list[Hit]) -> A
         operation["row_label"] = requested_row
     if requested_column:
         operation["column_label"] = requested_column
+    section_scope = top.get("_section_scope") or insurance_company_scope(top.get("context"))
+    if section_scope:
+        operation["section_scope"] = section_scope
     return AnswerDraft(answer, [answer], [operation])
 
 
 def _canonical_label(value: Any) -> str:
-    return re.sub(r"\s+", "", normalize_text(value)).lower()
+    return canonical_table_label(value)
 
 
 def choose_table_option(question: str, choices: list[str], hits: list[Hit]) -> tuple[str | None, float]:
@@ -659,7 +677,7 @@ def text_answer(question: str, choices: list[str] | None, hits: list[Hit]) -> An
 
 def _hit_text(hit: Hit) -> str:
     item = hit.item
-    return " ".join(str(item.get(k) or "") for k in ["content", "context", "indicator", "period", "value_text", "row_header", "column_header"])
+    return " ".join(str(item.get(k) or "") for k in ["content", "context", "_section_scope", "indicator", "period", "value_text", "row_header", "column_header"])
 
 
 def reason(question: str, qa_type: str, choices: list[str] | None, hits: list[Hit]) -> AnswerDraft:

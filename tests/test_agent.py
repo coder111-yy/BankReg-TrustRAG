@@ -141,6 +141,30 @@ def test_choice_agent_compares_table_column_values_and_accepts_total_alias():
     assert [item["cell_address"] for item in response.evidence] == ["G4", "G6", "G7", "G5"]
 
 
+def test_table_comparison_matches_generic_hierarchy_prefix_to_plain_option():
+    index = HybridIndex(
+        [{"doc_id": "report", "title": "年度机构统计表", "file_name": "report.xlsx"}],
+        [],
+        [
+            {"evidence_id": "cell:report:B5", "doc_id": "report", "indicator": "机构合计", "row_header": "机构合计", "column_header": "一季度", "period": "2023", "value_text": "300", "cell_address": "B5", "context": "机构合计 | 一季度 | 300"},
+            {"evidence_id": "cell:report:B6", "doc_id": "report", "indicator": "其中:甲类机构", "row_header": "其中:甲类机构", "column_header": "一季度", "period": "2023", "value_text": "200", "cell_address": "B6", "context": "其中:甲类机构 | 一季度 | 200"},
+            {"evidence_id": "cell:report:B7", "doc_id": "report", "indicator": "乙类机构", "row_header": "乙类机构", "column_header": "一季度", "period": "2023", "value_text": "100", "cell_address": "B7", "context": "乙类机构 | 一季度 | 100"},
+        ],
+    )
+
+    result = run_choice_agent(
+        index,
+        "根据年度机构统计表，在“一季度”口径下，以下哪一项数值最高？",
+        ["甲类机构", "乙类机构", "机构合计"],
+        "table_lookup",
+    )
+
+    assert result.selected_label == "C"
+    assert result.human_in_loop is None
+    assert result.assessments[0]["table_comparison"]["cell_address"] == "B6"
+    assert result.assessments[2]["table_comparison"]["cell_address"] == "B5"
+
+
 def test_table_comparison_uses_structured_row_queries_for_every_option():
     rows = {
         "全国合计": ("G4", 8225.18),

@@ -62,3 +62,8 @@ def test_table_label_normalization_removes_outline_prefix_but_keeps_decimal():
     assert canonical_table_label("1、财产险") == "财产险"
     assert canonical_table_label("（二） 人身险") == "人身险"
     assert canonical_table_label("1.21") == "1.21"
+
+
+def test_table_label_normalization_removes_generic_hierarchy_prefixes():
+    assert canonical_table_label("其中：任意机构") == canonical_table_label("任意机构")
+    assert canonical_table_label("其中包括，任意指标") == canonical_table_label("任意指标")

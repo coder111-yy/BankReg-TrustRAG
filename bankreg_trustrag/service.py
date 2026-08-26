@@ -93,17 +93,18 @@ class TrustRAGService:
         filters = {**(filters or {})}
         if parsed.entities.get("filenames"):
             filters["file_name"] = parsed.entities["filenames"]
-        if parsed.entities.get("table_name"):
+        if parsed.entities.get("title_hints"):
+            # A quoted attachment/document title is the user's most precise
+            # source constraint.  Do not OR it with a generic logical table
+            # name, which would admit every month/quarter of the same report.
+            filters["title"] = list(dict.fromkeys(parsed.entities["title_hints"]))
+        elif parsed.entities.get("table_name"):
             # A question can name a workbook's logical table without giving
             # its generated filename.  Use the logical title as a strict
             # document scope so an insurance table cannot outrank the bank
             # regulatory table with the same indicator and period.
             filters["title"] = [parsed.entities["table_name"]]
         if parsed.entities.get("title_hints"):
-            filters["title"] = list(dict.fromkeys([
-                *(filters.get("title") or []),
-                *parsed.entities["title_hints"],
-            ]))
             # Evaluation rows sometimes provide an attachment short name,
             # while ingestion stores the generated filename with a numeric
             # prefix.  If that filename has no exact match, the quoted source

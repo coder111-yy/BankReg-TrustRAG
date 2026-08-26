@@ -16,7 +16,7 @@ from typing import Any
 from .query import extract_dimension_labels, extract_inline_choices
 from .retrieval.index import Hit, HybridIndex
 from .schemas import ParsedQuery
-from .utils import canonical_table_label, normalize_text, normalized_number, tokens
+from .utils import canonical_dimension_label, canonical_table_label, normalize_text, normalized_number, tokens
 
 
 @dataclass(frozen=True)
@@ -269,7 +269,7 @@ def _table_comparison_result(
     if direction is None or len(choices) < 2:
         return None
     _, requested_column = extract_dimension_labels(question)
-    column_key = canonical_table_label(requested_column)
+    column_key = canonical_dimension_label(requested_column)
     if not column_key:
         return None
 
@@ -287,7 +287,7 @@ def _table_comparison_result(
             }
             if option_key not in row_keys:
                 continue
-            column_context = canonical_table_label(" ".join(
+            column_context = canonical_dimension_label(" ".join(
                 str(item.get(key) or "") for key in ("column_header", "period")
             ))
             if column_key not in column_context:

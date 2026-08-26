@@ -9,7 +9,16 @@ from pathlib import Path
 from typing import Any
 
 from ..schemas import Document, TableCellEvidence, TextEvidence
-from ..utils import compact_path, first_nonempty, normalize_text, sha256_file, stable_id
+from ..utils import (
+    compact_path,
+    first_nonempty,
+    insurance_company_scope,
+    is_insurance_fund_table,
+    normalize_text,
+    normalized_reporting_period,
+    sha256_file,
+    stable_id,
+)
 
 
 @dataclass
@@ -266,14 +275,13 @@ def _period_from_header(header: str | None) -> str | None:
     if not header:
         return None
     value = normalize_text(header)
-    m = re.search(r"(20\d{2})年\s*0?(\d{1,2})月", value)
-    if m:
-        return f"{m.group(1)}-{int(m.group(2)):02d}"
+    parsed_period = normalized_reporting_period(value)
+    if parsed_period:
+        return parsed_period
     m = re.search(r"(20\d{2})[-/]0?(\d{1,2})", value)
     if m:
         return f"{m.group(1)}-{int(m.group(2)):02d}"
-    m = re.search(r"(20\d{2})年", value)
-    return m.group(1) if m else value if re.search(r"\d", value) else None
+    return value if re.search(r"\d", value) else None
 
 
 _QUARTER_LABELS = {"一季度", "二季度", "三季度", "四季度"}
@@ -380,9 +388,13 @@ def _cell_records(doc: Document, sheet_name: str, rows: list[list[Any]], table_n
         headers.append(" / ".join(dict.fromkeys(pieces)))
     if _looks_like_quarter_matrix(rows, header_rows):
         return _quarter_matrix_records(doc, sheet_name, rows, header_rows, headers, table_name)
+    scoped_insurance_report = is_insurance_fund_table(doc.title, sheet_name, table_name)
+    active_scope = "保险业总体" if scoped_insurance_report else None
     for row_index, row in enumerate(rows, 1):
         row_header = first_nonempty(row[:2])
         indicator = row_header
+        if scoped_insurance_report:
+            active_scope = insurance_company_scope(row_header) or active_scope
         for column_index, value in enumerate(row, 1):
             if value is None or normalize_text(value) == "":
                 continue
@@ -391,7 +403,8 @@ def _cell_records(doc: Document, sheet_name: str, rows: list[list[Any]], table_n
             unit = None
             unit = _infer_unit(column_header, row_header)
             address = _excel_address(row_index, column_index)
-            context = f"{indicator or ''} | {column_header or ''} | {normalize_text(value)}"
+            context_parts = [active_scope, indicator, column_header, normalize_text(value)]
+            context = " | ".join(str(part) for part in context_parts if part)
             records.append(
                 TableCellEvidence(
                     evidence_id=f"cell:{doc.doc_id}:{sheet_name}:{address}",
