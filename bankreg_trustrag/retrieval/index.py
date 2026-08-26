@@ -263,6 +263,8 @@ class HybridIndex:
         requested_row, requested_column = extract_dimension_labels(query)
         normalized_row = _canonical_label(requested_row)
         normalized_column = _canonical_label(requested_column)
+        calculation_columns = _calculation_columns(query)
+        is_calculation = len(calculation_columns) >= 2
 
         # Period is a high-selectivity structured key. Restricting by it before
         # scoring avoids repeatedly computing similarity over the full million-cell
@@ -312,7 +314,11 @@ class HybridIndex:
             if row_indices:
                 candidate_indices = row_indices
 
-        if normalized_column:
+        # For a difference/change question, the two operands must survive the
+        # shortlist together.  Applying the normal single-column filter here
+        # keeps only the first column and makes the reasoning stage fall back
+        # to a plain value lookup.
+        if normalized_column and not is_calculation:
             column_indices = [
                 index for index in candidate_indices
                 if normalized_column in _canonical_label(" ".join(
@@ -361,6 +367,12 @@ class HybridIndex:
                 str(item.get(key) or "") for key in ["column_header", "period"]
             )):
                 table_score += 3.0
+            if is_calculation:
+                column_context = _canonical_label(" ".join(
+                    str(item.get(key) or "") for key in ["column_header", "context", "period"]
+                ))
+                if any(_canonical_label(column) in column_context for column in calculation_columns):
+                    table_score += 4.0
 
             if requested_quarter:
                 column_context = normalize_text(" ".join(
@@ -513,3 +525,18 @@ class HybridIndex:
 def _canonical_label(value: Any) -> str:
     """Normalize labels whose Excel cells contain layout spaces."""
     return re.sub(r"\s+", "", normalize_text(value)).lower()
+
+
+def _calculation_columns(query: str) -> list[str]:
+    """Return both quoted operands for table difference/change queries."""
+    normalized = normalize_text(query)
+    quoted = [
+        normalize_text(value).strip(" ：:，,、")
+        for value in re.findall(r"[“\"‘「『]([^”\"’」』]+)[”\"’」』]", normalized)
+    ]
+    if len(quoted) >= 3:
+        return quoted[1:3]
+    if len(quoted) == 2 and any(term in normalized for term in ("差值", "差额", "相差", "变化", "增减")):
+        return quoted
+    match = re.search(r"从[“\"‘「『]?([^”\"’」』\s，,。！？?]+)[”\"’」』]?到[“\"‘「『]?([^”\"’」』\s，,。！？?]+)", normalized)
+    return [match.group(1), match.group(2)] if match else []

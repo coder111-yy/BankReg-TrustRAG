@@ -62,7 +62,14 @@ class TrustRAGService:
         report("understanding", label="正在理解问题与识别查询类型")
         question_for_retrieval, inline_choices = extract_inline_choices(question)
         effective_choices = [str(value).strip() for value in (choices or inline_choices) if str(value).strip()]
-        question_for_analysis = _question_with_conversation_context(question_for_retrieval, conversation_context)
+        # Full, self-contained questions must remain isolated from earlier
+        # turns.  Mixing them with history can duplicate years/file hints and
+        # make the metadata gate or missing-year guard reject a valid repeat.
+        use_context = _is_follow_up_question(question_for_retrieval)
+        question_for_analysis = _question_with_conversation_context(
+            question_for_retrieval,
+            conversation_context if use_context else None,
+        )
         parsed = parse_query(question_for_analysis, effective_choices)
         # Keep the actual user message as the auditable original query.  The
         # contextual form is used only to resolve follow-up references during
@@ -188,7 +195,7 @@ class TrustRAGService:
             else:
                 draft = reason(question_for_retrieval, parsed.qa_type, None, hits)
         llm_generation = self.generator.status() if hasattr(self, "generator") else {"provider": "none", "enabled": False, "status": "disabled"}
-        if choice_result is None and hits and not _has_terminal_operation(draft.operations):
+        if choice_result is None and hits and not _has_terminal_operation(draft.operations) and not _has_deterministic_operation(draft.operations):
             generator = getattr(self, "generator", None)
             if generator is not None and generator.enabled:
                 report("generating", label="正在基于已检索证据生成回答")
@@ -226,7 +233,7 @@ class TrustRAGService:
                 else:
                     draft.operations.append(generation_operation)
         report("verifying", label="正在核验数值、实体、版本与证据支持")
-        verification = verify_claims(draft.answer, question, hits, draft.claims)
+        verification = verify_claims(draft.answer, question, hits, draft.claims, draft.operations)
         retry_record: dict[str, Any] | None = None
         if _should_retry_verification(verification, draft, choice_result, missing_year):
             retry_query = _verification_retry_query(parsed, question_for_retrieval)
@@ -256,7 +263,7 @@ class TrustRAGService:
                 )
             else:
                 draft = _choice_answer_draft(choice_result) if choice_result is not None else reason(question_for_retrieval, parsed.qa_type, None, hits)
-            verification = verify_claims(draft.answer, question, hits, draft.claims)
+            verification = verify_claims(draft.answer, question, hits, draft.claims, draft.operations)
             retry_record = {
                 "type": "verification_retry",
                 "query": retry_query,
@@ -434,6 +441,10 @@ def _has_terminal_operation(operations: list[dict[str, Any]]) -> bool:
     return any(operation.get("type") in {"refusal", "clarification", "human_in_loop"} for operation in operations)
 
 
+def _has_deterministic_operation(operations: list[dict[str, Any]]) -> bool:
+    return any(operation.get("type") == "table_calculation" for operation in operations)
+
+
 def _requested_year_missing(years: list[str], hits: list[Any]) -> str | None:
     if not years:
         return None
@@ -468,6 +479,13 @@ def _question_with_conversation_context(question: str, messages: list[dict[str, 
         return question
     history = "\n".join(f"历史问题：{item[:360]}" for item in prior_questions)
     return f"{history}\n当前问题：{question}"
+
+
+def _is_follow_up_question(question: str) -> bool:
+    compact = re.sub(r"\s+", "", str(question))
+    return len(compact) <= 100 and any(
+        token in compact for token in ("这个", "那个", "上述", "刚才", "前面", "继续", "再查", "再看", "那", "它")
+    )
 
 
 def _retrieved_document_labels(hits: list[Any], limit: int = 6) -> list[str]:

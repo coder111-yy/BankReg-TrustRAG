@@ -17,7 +17,13 @@ TRACKED_ENTITIES = (
 )
 
 
-def verify_claims(answer: str, question: str, hits: list[Hit], claims: list[str]) -> Verification:
+def verify_claims(
+    answer: str,
+    question: str,
+    hits: list[Hit],
+    claims: list[str],
+    operations: list[dict[str, Any]] | None = None,
+) -> Verification:
     verification = Verification()
     if not hits:
         verification.citation_ok = False
@@ -34,6 +40,7 @@ def verify_claims(answer: str, question: str, hits: list[Hit], claims: list[str]
     # comparing metric values; dates are verified separately below.
     answer_numbers = numbers_in(_without_dates(_without_citations(answer)))
     evidence_numbers = numbers_in(_without_dates(evidence))
+    evidence_numbers.extend(_deterministic_result_numbers(operations or []))
     for number in answer_numbers:
         if not any(abs(number - expected) < max(1e-9, abs(expected) * 1e-8) for expected in evidence_numbers):
             verification.numeric_ok = False
@@ -47,7 +54,7 @@ def verify_claims(answer: str, question: str, hits: list[Hit], claims: list[str]
     if normative_in_answer and not any(word in normative_in_evidence for word in normative_in_answer):
         verification.normative_strength_ok = False
         verification.unsupported_claims.append("规范性用语可能超出证据")
-    verification.claim_results = _verify_claims_against_individual_evidence(claims, hits)
+    verification.claim_results = _verify_claims_against_individual_evidence(claims, hits, operations or [])
     for result in verification.claim_results:
         if not result["supported"]:
             verification.unsupported_claims.append(str(result["text"])[:120])
@@ -70,7 +77,11 @@ def _evidence_for_hit(hit: Hit) -> str:
     ])
 
 
-def _verify_claims_against_individual_evidence(claims: list[str], hits: list[Hit]) -> list[dict[str, Any]]:
+def _verify_claims_against_individual_evidence(
+    claims: list[str],
+    hits: list[Hit],
+    operations: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     for index, claim in enumerate(claims):
         text = normalize_text(claim)
@@ -83,6 +94,8 @@ def _verify_claims_against_individual_evidence(claims: list[str], hits: list[Hit
         # retaining the complete supporting ID chain.
         if not evidence_ids and len(hits) > 1 and _claim_supported(text, "\n".join(_evidence_for_hit(hit) for hit in hits)):
             evidence_ids = [hit.evidence_id for hit in hits]
+        if not evidence_ids:
+            evidence_ids = _calculation_supporting_evidence(text, operations)
         results.append({
             "claim_id": f"claim_{index + 1}",
             "text": text,
@@ -90,6 +103,40 @@ def _verify_claims_against_individual_evidence(claims: list[str], hits: list[Hit
             "supported": bool(evidence_ids),
         })
     return results
+
+
+def _deterministic_result_numbers(operations: list[dict[str, Any]]) -> list[float]:
+    """Allow verified calculator outputs in addition to source-cell numbers."""
+    numbers: list[float] = []
+    for operation in operations:
+        if operation.get("type") != "table_calculation":
+            continue
+        for key in ("result", "difference", "value"):
+            value = operation.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                numbers.append(float(value))
+            elif isinstance(value, str):
+                parsed = normalized_number(value)
+                if parsed is not None:
+                    numbers.append(float(parsed))
+    return numbers
+
+
+def _calculation_supporting_evidence(claim: str, operations: list[dict[str, Any]]) -> list[str]:
+    """Link a calculation claim to its audited operand cells."""
+    for operation in operations:
+        if operation.get("type") != "table_calculation":
+            continue
+        result = operation.get("result", operation.get("difference"))
+        parsed = normalized_number(result)
+        if parsed is None:
+            continue
+        claim_numbers = numbers_in(_without_dates(_without_citations(claim)))
+        if any(abs(number - parsed) < max(1e-9, abs(parsed) * 1e-8) for number in claim_numbers):
+            ids = [str(item) for item in operation.get("operand_evidence_ids", []) if item]
+            if ids:
+                return ids
+    return []
 
 
 def _verify_entities_and_references(answer: str, question: str, evidence: str, verification: Verification) -> None:

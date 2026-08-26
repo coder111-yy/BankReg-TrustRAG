@@ -354,6 +354,99 @@ def choose_option(question: str, choices: list[str], hits: list[Hit]) -> tuple[s
     return "ABCD"[scores[0][0]] if scores[0][0] < 4 else None, confidence, evidence
 
 
+def _is_table_calculation_question(question: str) -> bool:
+    normalized = normalize_text(question)
+    has_calculation_word = any(term in normalized for term in ("差值", "差额", "相差", "变化", "增减", "增长", "减少", "差多少"))
+    has_two_dimension_hint = any(term in normalized for term in ("从", "到", "与", "和", "之间"))
+    quoted_count = len(re.findall(r"[“\"‘「『]([^”\"’」』]+)[”\"’」』]", normalized))
+    return has_calculation_word and (has_two_dimension_hint or quoted_count >= 3)
+
+
+def _calculation_labels(question: str) -> tuple[str | None, list[str]]:
+    """Extract the row plus two quoted columns from a table-change question."""
+    normalized = normalize_text(question)
+    quoted = [
+        normalize_text(value).strip(" ：:，,、")
+        for value in re.findall(r"[“\"‘「『]([^”\"’」』]+)[”\"’」』]", normalized)
+    ]
+    row = quoted[0] if quoted else ("全国合计" if "全国合计" in normalized else None)
+    if len(quoted) >= 3:
+        return row, quoted[1:3]
+    if len(quoted) == 2 and any(term in normalized for term in ("差值", "差额", "相差", "变化", "增减")):
+        return ("全国合计" if "全国合计" in normalized else None), quoted
+    match = re.search(r"从[“\"‘「『]?([^”\"’」』\s，,。！？?]+)[”\"’」』]?到[“\"‘「『]?([^”\"’」』\s，,。！？?]+)", normalized)
+    if match:
+        return row, [match.group(1), match.group(2)]
+    return row, []
+
+
+def _calculation_answer(question: str, hits: list[Hit]) -> AnswerDraft | None:
+    row_label, columns = _calculation_labels(question)
+    if len(columns) < 2:
+        return None
+    candidates = [hit for hit in hits if hit.kind == "table"]
+    if row_label:
+        row_key = _canonical_label(row_label)
+        row_hits = [
+            hit for hit in candidates
+            if row_key in {
+                _canonical_label(hit.item.get("indicator")),
+                _canonical_label(hit.item.get("row_header")),
+            }
+        ]
+        if row_hits:
+            candidates = row_hits
+    operands: list[tuple[str, Hit]] = []
+    for column in columns:
+        column_key = _canonical_label(column)
+        matches = [
+            hit for hit in candidates
+            if column_key in _canonical_label(" ".join(
+                str(hit.item.get(key) or "") for key in ["column_header", "context", "period"]
+            ))
+            and _table_numeric_value(_load_table_value(hit.item.get("value_text"))) is not None
+        ]
+        if not matches:
+            return None
+        matches.sort(key=lambda hit: (hit.table_score, hit.lexical_score, hit.fused_score), reverse=True)
+        operands.append((column, matches[0]))
+    start_label, start_hit = operands[0]
+    end_label, end_hit = operands[1]
+    start_value = _table_numeric_value(_load_table_value(start_hit.item.get("value_text")))
+    end_value = _table_numeric_value(_load_table_value(end_hit.item.get("value_text")))
+    if start_value is None or end_value is None:
+        return None
+    # Remove binary floating-point residue while retaining enough precision
+    # for regulatory/statistical values that carry more than two decimals.
+    difference = round(end_value - start_value, 10)
+    unit = normalize_text(start_hit.item.get("unit") or end_hit.item.get("unit"))
+    difference_display = f"{difference:.6f}".rstrip("0").rstrip(".")
+    if unit:
+        difference_display += unit
+    period = normalize_text(start_hit.item.get("period") or end_hit.item.get("period"))
+    row_display = row_label or normalize_text(start_hit.item.get("indicator")) or "该行"
+    start_display = f"{start_value:.10f}".rstrip("0").rstrip(".")
+    end_display = f"{end_value:.10f}".rstrip("0").rstrip(".")
+    answer = f"“{row_display}”从“{start_label}”到“{end_label}”的数值变化为：{difference_display}（{end_display} - {start_display}）。"
+    operation = {
+        "type": "table_calculation",
+        "calculation": "difference",
+        "formula": f"{end_label} - {start_label}",
+        "period": period,
+        "row_label": row_display,
+        "start_label": start_label,
+        "end_label": end_label,
+        "start_value": start_value,
+        "end_value": end_value,
+        "difference": difference,
+        "result": difference,
+        "unit": unit,
+        "operand_evidence_ids": [start_hit.evidence_id, end_hit.evidence_id],
+        "display_evidence_ids": [start_hit.evidence_id, end_hit.evidence_id],
+    }
+    return AnswerDraft(answer, [answer], [operation])
+
+
 def table_answer(question: str, choices: list[str] | None, hits: list[Hit]) -> AnswerDraft:
     table_hits = [hit for hit in hits if hit.kind == "table"]
     if choices:
@@ -363,6 +456,10 @@ def table_answer(question: str, choices: list[str] | None, hits: list[Hit]) -> A
             return AnswerDraft(f"选项 {option}：{selected}", [selected], [{"type": "table_lookup", "confidence": confidence}])
     if not table_hits:
         return AnswerDraft("当前证据不足，无法可靠回答。", [], [])
+    if _is_table_calculation_question(question):
+        calculated = _calculation_answer(question, table_hits)
+        if calculated is not None:
+            return calculated
     # A table title/period alone is not an indicator. For broad questions,
     # return a useful clarification with the located source instead of picking
     # an arbitrary cell from a multi-indicator report.
