@@ -9,7 +9,7 @@ from typing import Any, Iterable
 
 from ..schemas import TableCellEvidence, TextEvidence
 from ..query import extract_dimension_labels, extract_indicator
-from ..utils import char_ngrams, normalize_text, normalized_number, tokens
+from ..utils import canonical_table_label, char_ngrams, normalize_text, normalized_number, tokens
 from .bge import BGEPipeline, PersistentVectorIndex
 
 
@@ -523,8 +523,8 @@ class HybridIndex:
 
 
 def _canonical_label(value: Any) -> str:
-    """Normalize labels whose Excel cells contain layout spaces."""
-    return re.sub(r"\s+", "", normalize_text(value)).lower()
+    """Normalize labels whose Excel cells contain layout decoration."""
+    return canonical_table_label(value)
 
 
 def _calculation_columns(query: str) -> list[str]:

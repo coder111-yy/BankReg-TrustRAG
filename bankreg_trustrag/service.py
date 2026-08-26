@@ -401,6 +401,25 @@ def _choice_answer_draft(choice_result: Any) -> AnswerDraft:
     if selected_index is not None and selected_index < len(choice_result.choices):
         selected = assessments[selected_index]
         label = selected["label"]
+        comparison = selected.get("table_comparison")
+        if comparison:
+            direction_text = "最高" if comparison.get("direction") == "max" else "最低"
+            selected_text = choice_result.choices[selected_index]
+            answer = f"选项 {label}：{selected_text}（在“{comparison.get('column')}”口径下数值{direction_text}）。"
+            return AnswerDraft(
+                answer,
+                [],
+                [{
+                    "type": "choice_agent",
+                    "intent": "table_comparison",
+                    "selected_option": label,
+                    "selected_text": selected_text,
+                    "confidence": selected["score"],
+                    "comparison": comparison,
+                    "option_assessments": assessments,
+                    "display_evidence_ids": selected.get("evidence_ids", []),
+                }],
+            )
         # The original option may strengthen a normative phrase relative to a
         # split clause (for example, an enumerated qualifying condition). The
         # answer therefore returns the verified option label and exposes the

@@ -4,7 +4,12 @@ import hashlib
 import re
 import unicodedata
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
+
+
+_TABLE_OUTLINE_PREFIX_RE = re.compile(
+    r"^(?:\((?:\d+|[一二三四五六七八九十百]+)\)[、.．:：]?|(?:\d+|[一二三四五六七八九十百]+)[)、.．:：](?!\d))"
+)
 
 
 def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
@@ -28,6 +33,19 @@ def normalize_text(value: object) -> str:
     text = unicodedata.normalize("NFKC", text)
     text = text.replace("\u00a0", " ")
     return re.sub(r"\s+", " ", text).strip()
+
+
+def canonical_table_label(value: Any) -> str:
+    """Normalize a user/table label without erasing meaningful digits.
+
+    Spreadsheet row labels often contain visual outline prefixes such as
+    ``1、财产险`` or ``(二) 人身险`` while users naturally ask for
+    ``财产险`` and ``人身险``.  A separator is required before a numeric
+    prefix is removed, so labels such as ``1年期贷款`` remain intact.
+    """
+    label = re.sub(r"\s+", "", normalize_text(value)).lower()
+    label = _TABLE_OUTLINE_PREFIX_RE.sub("", label, count=1)
+    return label.replace("总计", "合计")
 
 
 def tokens(text: str) -> list[str]:

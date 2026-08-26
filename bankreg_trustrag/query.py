@@ -180,15 +180,25 @@ def extract_dimension_labels(text: str) -> tuple[str | None, str | None]:
     normalized = normalize_text(text)
     quoted = [
         normalize_text(value).strip(" ：:，,、")
-        for value in re.findall(r"[“\"「『]([^”\"」』]+)[”\"」』]", normalized)
+        for value in re.findall(r"[“\"‘「『]([^”\"’」』]+)[”\"’」』]", normalized)
     ]
     quoted = [value for value in quoted if value]
-    row_label = quoted[0] if quoted else None
-    column_label = quoted[1] if len(quoted) > 1 else None
-    if row_label and column_label is None:
-        match = re.search(r"[“\"「『]([^”\"」』]+)[”\"」』].{0,12}?(?:口径|列|栏目|下)(?:为|是)?[“\"「『]?([^”\"」』，。？！?]*)", normalized)
-        if match:
-            column_label = normalize_text(match.group(2)).strip(" ：:，,、") or None
+
+    # In ``在“健康险”口径下`` the only quoted label is a column, not a row.
+    # Treat the grammatical marker as authoritative before falling back to
+    # positional quoted labels.  This also preserves the common form
+    # ``“全国合计”在“合计”口径下`` as row=全国合计, column=合计.
+    column_match = re.search(
+        r"(?:在|按|以)\s*[“\"‘「『]?([^”\"’」』，。？！?]{1,24})[”\"’」』]?\s*(?:口径|列|栏目)(?:下|中)?",
+        normalized,
+    )
+    column_label = normalize_text(column_match.group(1)).strip(" ：:，,、") if column_match else None
+    row_candidates = [value for value in quoted if value != column_label]
+    row_label = row_candidates[0] if row_candidates else None
+    if column_label is None and len(quoted) > 1:
+        row_label, column_label = quoted[0], quoted[1]
+    elif column_label is None and quoted:
+        row_label = quoted[0]
     if row_label is None and "全国合计" in normalized:
         row_label = "全国合计"
     if column_label is None and re.search(r"(?:在|按|以)[“\"「『]?合计[”\"」』]?(?:口径|列|栏目)?(?:下|中)?", normalized):

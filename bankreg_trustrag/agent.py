@@ -8,14 +8,15 @@ structured Human-in-the-loop handoff when the evidence is insufficient.
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from typing import Any
 
-from .query import extract_inline_choices
+from .query import extract_dimension_labels, extract_inline_choices
 from .retrieval.index import Hit, HybridIndex
 from .schemas import ParsedQuery
-from .utils import normalize_text, normalized_number, tokens
+from .utils import canonical_table_label, normalize_text, normalized_number, tokens
 
 
 @dataclass(frozen=True)
@@ -225,6 +226,146 @@ def _numeric_choice_value(option: str) -> float | None:
     return normalized_number(value)
 
 
+def _strict_table_number(value: Any) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError:
+            decoded = value
+        if decoded != value or not isinstance(decoded, str):
+            return _strict_table_number(decoded)
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = normalize_text(value)
+    if not re.fullmatch(r"[-+]?\d[\d,]*(?:\.\d+)?\s*[%％]?", text):
+        return None
+    return normalized_number(text)
+
+
+def _comparison_direction(question: str) -> str | None:
+    normalized = normalize_text(question)
+    if any(term in normalized for term in ("最高", "最大", "最多")):
+        return "max"
+    if any(term in normalized for term in ("最低", "最小", "最少")):
+        return "min"
+    return None
+
+
+def _table_comparison_result(
+    question: str,
+    choices: list[str],
+    option_hits: dict[int, list[Hit]],
+) -> dict[str, Any] | None:
+    """Compare the same structured column across row-label choices.
+
+    Textual option support cannot answer questions such as "which region has
+    the highest health-insurance value": every region label is present in the
+    workbook, so all options otherwise tie. Resolve these questions from the
+    exact numeric cells, and only when every option has a comparable value.
+    """
+    direction = _comparison_direction(question)
+    if direction is None or len(choices) < 2:
+        return None
+    _, requested_column = extract_dimension_labels(question)
+    column_key = canonical_table_label(requested_column)
+    if not column_key:
+        return None
+
+    option_candidates: list[list[dict[str, Any]]] = []
+    for option_index, option in enumerate(choices[:4]):
+        option_key = canonical_table_label(option)
+        candidates: list[tuple[Hit, float]] = []
+        for hit in option_hits.get(option_index, []):
+            if hit.kind != "table":
+                continue
+            item = hit.item
+            row_keys = {
+                canonical_table_label(item.get("indicator")),
+                canonical_table_label(item.get("row_header")),
+            }
+            if option_key not in row_keys:
+                continue
+            column_context = canonical_table_label(" ".join(
+                str(item.get(key) or "") for key in ("column_header", "period")
+            ))
+            if column_key not in column_context:
+                continue
+            value = _strict_table_number(item.get("value_text"))
+            if value is not None:
+                candidates.append((hit, value))
+        if not candidates:
+            return None
+        unique: dict[str, dict[str, Any]] = {}
+        for hit, value in candidates:
+            unique[hit.evidence_id] = {
+                "value": value,
+                "evidence_id": hit.evidence_id,
+                "cell_address": hit.item.get("cell_address"),
+            }
+        option_candidates.append(sorted(unique.values(), key=_comparison_candidate_sort_key))
+
+    ranges = [
+        (min(item["value"] for item in candidates), max(item["value"] for item in candidates))
+        for candidates in option_candidates
+    ]
+    winners: list[int] = []
+    for index, (lower, upper) in enumerate(ranges):
+        other_ranges = [value_range for other_index, value_range in enumerate(ranges) if other_index != index]
+        if not other_ranges:
+            continue
+        if direction == "max":
+            other_boundary = max(value_range[1] for value_range in other_ranges)
+            wins = _strictly_separated(lower, other_boundary, direction)
+        else:
+            other_boundary = min(value_range[0] for value_range in other_ranges)
+            wins = _strictly_separated(upper, other_boundary, direction)
+        if wins:
+            winners.append(index)
+    if len(winners) != 1:
+        return None
+
+    selected_index = winners[0]
+    values: list[dict[str, Any]] = []
+    evidence_ids: list[str] = []
+    for option_index, candidates in enumerate(option_candidates):
+        # Use conservative bounds in the displayed comparison: the winner's
+        # worst possible value versus every loser's best possible value.  This
+        # lets a repeated row label remain answerable only when every matching
+        # row leads to the same result.
+        if direction == "max":
+            chosen = min(candidates, key=lambda item: item["value"]) if option_index == selected_index else max(candidates, key=lambda item: item["value"])
+        else:
+            chosen = max(candidates, key=lambda item: item["value"]) if option_index == selected_index else min(candidates, key=lambda item: item["value"])
+        values.append({
+            "choice_index": option_index,
+            "label": "ABCD"[option_index],
+            "text": choices[option_index],
+            **chosen,
+            "candidate_values": candidates,
+        })
+        evidence_ids.extend(item["evidence_id"] for item in candidates)
+    return {
+        "selected_index": selected_index,
+        "direction": direction,
+        "column": requested_column,
+        "values": values,
+        "evidence_ids": list(dict.fromkeys(evidence_ids)),
+    }
+
+
+def _comparison_candidate_sort_key(item: dict[str, Any]) -> tuple[int, str, float]:
+    address = str(item.get("cell_address") or "")
+    match = re.search(r"(\d+)$", address)
+    return (int(match.group(1)) if match else 10**9, address, float(item["value"]))
+
+
+def _strictly_separated(left: float, right: float, direction: str) -> bool:
+    tolerance = max(1e-9, max(abs(left), abs(right)) * 1e-8)
+    return left - right > tolerance if direction == "max" else right - left > tolerance
+
+
 def _claim_support(claim: str, hit: Hit) -> float:
     evidence = _hit_text(hit)
     normalized_claim = normalize_text(claim)
@@ -314,6 +455,8 @@ def run_choice_agent(
     """Retrieve each choice independently with one shared BGE rerank pass."""
     option_hits: dict[int, list[Hit]] = {}
     assessments: list[dict[str, Any]] = []
+    comparison_direction = _comparison_direction(question)
+    _, comparison_column = extract_dimension_labels(question)
     # Rerank the stem once. Option-specific calls below still use independent
     # lexical/vector retrieval, but skip their duplicate CrossEncoder passes.
     # This preserves evidence separation while removing the largest CPU cost.
@@ -323,7 +466,14 @@ def run_choice_agent(
         # The stem and the option are deliberately searched separately.  A
         # single query containing all options lets common words dominate and
         # was the source of the unrelated answer shown in the screenshot.
-        option_query = f"{question} 选项{label} {option}"
+        if comparison_direction and comparison_column:
+            # Make both table dimensions explicit so structured retrieval
+            # filters to the option row before BGE reranking. Without this,
+            # an exact row such as 天津 can be pushed out of a small top-k by
+            # semantically similar rows, leaving the comparison incomplete.
+            option_query = f"{question} 选项{label} “{option}”在“{comparison_column}”口径下"
+        else:
+            option_query = f"{question} 选项{label} {option}"
         option_specific_hits = _agent_search(index, option_query, qa_type, max(4, min(top_k, 12)), filters, rerank=False, dense=False)
         hits = _merge_option_hits(option_specific_hits, shared_hits)
         option_hits[option_index] = hits
@@ -337,10 +487,29 @@ def run_choice_agent(
             "retrieved_evidence_ids": [hit.evidence_id for hit in hits[:6]],
         })
 
-    ranked = sorted(enumerate(assessments), key=lambda item: item[1]["score"], reverse=True)
     selected_index: int | None = None
     human_in_loop: dict[str, Any] | None = None
-    if ranked:
+    comparison = _table_comparison_result(question, choices, option_hits)
+    if comparison is not None:
+        selected_index = int(comparison["selected_index"])
+        for index, assessment in enumerate(assessments):
+            comparison_value = comparison["values"][index]
+            is_selected = index == selected_index
+            assessment.update({
+                "score": 1.0 if is_selected else 0.0,
+                "minimum_claim_score": 1.0 if is_selected else 0.0,
+                "evidence_ids": comparison["evidence_ids"] if is_selected else [comparison_value["evidence_id"]],
+                "table_comparison": {
+                    "direction": comparison["direction"],
+                    "column": comparison["column"],
+                    "value": comparison_value["value"],
+                    "cell_address": comparison_value["cell_address"],
+                    "evidence_id": comparison_value["evidence_id"],
+                    "compared_values": comparison["values"] if is_selected else None,
+                },
+            })
+    ranked = sorted(enumerate(assessments), key=lambda item: item[1]["score"], reverse=True)
+    if selected_index is None and ranked:
         best_index, best = ranked[0]
         second_score = ranked[1][1]["score"] if len(ranked) > 1 else 0.0
         margin = float(best["score"]) - float(second_score)

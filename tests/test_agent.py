@@ -94,6 +94,148 @@ def test_choice_agent_reranks_shared_stem_only_once():
     assert [(rerank, dense) for _, rerank, dense in index.calls] == [(True, True), (False, False), (False, False)]
 
 
+def test_choice_agent_compares_table_column_values_and_accepts_total_alias():
+    index = HybridIndex(
+        [{"doc_id": "report", "title": "2024年9月全国各地区原保险保费收入情况表", "file_name": "report.xlsx", "status": "effective"}],
+        [],
+        [
+            {"evidence_id": "cell:report:G4", "doc_id": "report", "indicator": "全国合计", "row_header": "全国合计", "column_header": "健康险", "period": "2024-09", "value_text": "8225.18", "cell_address": "G4", "context": "全国合计 | 健康险 | 8225.18"},
+            {"evidence_id": "cell:report:G5", "doc_id": "report", "indicator": "公司本级", "row_header": "公司本级", "column_header": "健康险", "period": "2024-09", "value_text": "2.96", "cell_address": "G5", "context": "公司本级 | 健康险 | 2.96"},
+            {"evidence_id": "cell:report:G6", "doc_id": "report", "indicator": "北 京", "row_header": "北 京", "column_header": "健康险", "period": "2024-09", "value_text": "495.59", "cell_address": "G6", "context": "北 京 | 健康险 | 495.59"},
+            {"evidence_id": "cell:report:G7", "doc_id": "report", "indicator": "天 津", "row_header": "天 津", "column_header": "健康险", "period": "2024-09", "value_text": "97.37", "cell_address": "G7", "context": "天 津 | 健康险 | 97.37"},
+        ],
+    )
+
+    result = run_choice_agent(
+        index,
+        "根据《2024年9月全国各地区原保险保费收入情况表》，在“健康险”口径下，以下哪一项数值最高？",
+        ["全国总计", "北京", "天津", "公司本级"],
+        "table_lookup",
+        filters={"title": ["全国各地区原保险保费收入情况表"]},
+    )
+
+    assert result.selected_label == "A"
+    assert result.human_in_loop is None
+    assert result.assessments[0]["table_comparison"]["value"] == 8225.18
+    assert result.assessments[0]["evidence_ids"] == [
+        "cell:report:G4",
+        "cell:report:G6",
+        "cell:report:G7",
+        "cell:report:G5",
+    ]
+
+    service = TrustRAGService.__new__(TrustRAGService)
+    service.settings = SimpleNamespace(min_trust=0.58, top_k=8)
+    service.store = SimpleNamespace(save_qa=lambda *args: None)
+    service.index = index
+    service.semantic = SimpleNamespace(enabled=False)
+    response = service.ask(
+        "根据 Excel 附件《2024年9月全国各地区原保险保费收入情况表》，"
+        "在“健康险”口径下，以下哪一项数值最高？"
+        "A.全国总计 B.北京 C.天津 D.公司本级"
+    )
+
+    assert response.answer == "选项 A：全国总计（在“健康险”口径下数值最高）。"
+    assert response.trust["decision"] == "answer"
+    assert response.query_plan["agent"]["selected_option"] == "A"
+    assert [item["cell_address"] for item in response.evidence] == ["G4", "G6", "G7", "G5"]
+
+
+def test_table_comparison_uses_structured_row_queries_for_every_option():
+    rows = {
+        "全国合计": ("G4", 8225.18),
+        "北京": ("G6", 495.59),
+        "天津": ("G7", 97.37),
+        "公司本级": ("G5", 2.96),
+    }
+
+    class StructuredOnlyIndex:
+        def __init__(self):
+            self.calls = []
+
+        def hybrid_search(self, query, qa_type, top_k=8, filters=None, *, rerank=True, dense=True):
+            self.calls.append(query)
+            hits = []
+            for row, (cell, value) in rows.items():
+                if f"“{row}”在“健康险”口径下" not in query:
+                    continue
+                hits.append(Hit("table", {
+                    "evidence_id": f"cell:report:{cell}",
+                    "indicator": row,
+                    "row_header": row,
+                    "column_header": "健康险",
+                    "period": "2024-09",
+                    "value_text": str(value),
+                    "cell_address": cell,
+                    "context": f"{row} | 健康险 | {value}",
+                }, fused_score=0.2))
+            return hits
+
+    index = StructuredOnlyIndex()
+    result = run_choice_agent(
+        index,
+        "根据2024年9月统计表，在“健康险”口径下，以下哪一项数值最高？",
+        list(rows),
+        "table_lookup",
+    )
+
+    assert result.selected_label == "A"
+    assert all(
+        any(f"“{row}”在“健康险”口径下" in query for query in index.calls)
+        for row in rows
+    )
+
+
+def test_table_comparison_accepts_numbered_repeated_rows_when_winner_is_unambiguous():
+    index = HybridIndex(
+        [{"doc_id": "report", "title": "2025年9月保险业经营情况表", "file_name": "report.xlsx", "status": "effective"}],
+        [],
+        [
+            {"evidence_id": "cell:report:C7", "doc_id": "report", "indicator": "原保险保费收入", "row_header": "原保险保费收入", "column_header": "单位:亿元 / 本年累计/截至当期", "period": "2025-09", "value_text": "52145.77", "cell_address": "C7", "context": "原保险保费收入 | 本年累计/截至当期 | 52145.77"},
+            {"evidence_id": "cell:report:C8", "doc_id": "report", "indicator": "1、财产险", "row_header": "1、财产险", "column_header": "单位:亿元 / 本年累计/截至当期", "period": "2025-09", "value_text": "11250.32", "cell_address": "C8", "context": "1、财产险 | 本年累计/截至当期 | 11250.32"},
+            {"evidence_id": "cell:report:C9", "doc_id": "report", "indicator": "2、人身险", "row_header": "2、人身险", "column_header": "单位:亿元 / 本年累计/截至当期", "period": "2025-09", "value_text": "40895.45", "cell_address": "C9", "context": "2、人身险 | 本年累计/截至当期 | 40895.45"},
+            {"evidence_id": "cell:report:C11", "doc_id": "report", "indicator": "1、财产险", "row_header": "1、财产险", "column_header": "单位:亿元 / 本年累计/截至当期", "period": "2025-09", "value_text": "6981.4", "cell_address": "C11", "context": "1、财产险 | 本年累计/截至当期 | 6981.4"},
+            {"evidence_id": "cell:report:C12", "doc_id": "report", "indicator": "2、人身险", "row_header": "2、人身险", "column_header": "单位:亿元 / 本年累计/截至当期", "period": "2025-09", "value_text": "11725.37", "cell_address": "C12", "context": "2、人身险 | 本年累计/截至当期 | 11725.37"},
+            {"evidence_id": "cell:report:C13", "doc_id": "report", "indicator": "总资产", "row_header": "总资产", "column_header": "单位:亿元 / 本年累计/截至当期", "period": "2025-09", "value_text": "404005.89", "cell_address": "C13", "context": "总资产 | 本年累计/截至当期 | 404005.89"},
+        ],
+    )
+    question = (
+        "根据 Excel 附件《2025年9月保险业经营情况表》（工作表：保险业经营数据（月度）），"
+        "在“本年累计/截至当期”口径下，以下哪一项数值最高？"
+    )
+
+    result = run_choice_agent(
+        index,
+        question,
+        ["人身险", "原保险保费收入", "总资产", "财产险"],
+        "table_lookup",
+        filters={"title": ["2025年9月保险业经营情况表"]},
+    )
+
+    assert result.selected_label == "C"
+    assert result.human_in_loop is None
+    assert result.assessments[2]["table_comparison"]["value"] == 404005.89
+    assert result.assessments[2]["evidence_ids"] == [
+        "cell:report:C9",
+        "cell:report:C12",
+        "cell:report:C7",
+        "cell:report:C13",
+        "cell:report:C8",
+        "cell:report:C11",
+    ]
+
+    service = TrustRAGService.__new__(TrustRAGService)
+    service.settings = SimpleNamespace(min_trust=0.58, top_k=8)
+    service.store = SimpleNamespace(save_qa=lambda *args: None)
+    service.index = index
+    service.semantic = SimpleNamespace(enabled=False)
+    response = service.ask(question + "A.人身险 B.原保险保费收入 C.总资产 D.财产险")
+
+    assert response.answer == "选项 C：总资产（在“本年累计/截至当期”口径下数值最高）。"
+    assert response.trust["decision"] == "answer"
+    assert response.query_plan["agent"]["selected_option"] == "C"
+
+
 def test_choice_agent_hands_off_when_no_option_has_evidence():
     index = HybridIndex(
         [{"doc_id": "d1", "title": "无关资料", "file_name": "other.docx", "status": "effective"}],
