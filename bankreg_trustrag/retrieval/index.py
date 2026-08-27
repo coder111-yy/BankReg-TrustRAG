@@ -284,8 +284,36 @@ class HybridIndex:
         file_name = normalize_text(str(document.get("file_name") or "")).lower()
         return title in {"qa数据", "qa数据集", "qa data"} or file_name in {"qa数据.xlsx", "qa数据集.xlsx"}
 
+    @staticmethod
+    def _numeric_terms(value: str) -> tuple[set[str], set[str]]:
+        """提取文本中的百分比和普通数字，用于精确数字检索加权。"""
+        normalized = normalize_text(value).replace("％", "%")
+
+        matches = re.findall(
+            r"[-+]?\d[\d,]*(?:\.\d+)?\s*%?",
+            normalized,
+        )
+
+        cleaned = {
+            match.replace(",", "").replace(" ", "")
+            for match in matches
+        }
+
+        percentages = {
+            value for value in cleaned if value.endswith("%")
+        }
+
+        # 去掉百分号后也保留数值，兼容“35”和“35%”两种写法
+        numbers = {
+            value.rstrip("%")
+            for value in cleaned
+        }
+
+        return percentages, numbers
+
     def search_text(self, query: str, top_k: int = 8, filters: dict[str, Any] | None = None) -> list[Hit]:
         q_tokens = tokens(query)
+        query_percentages, query_numbers = self._numeric_terms(query)
         candidate_indices = self._candidate_indices("text", filters)
         allowed_ids = {str(self.text[index].get("evidence_id")) for index in candidate_indices}
         vector_scores: dict[str, float] = {}
@@ -295,6 +323,35 @@ class HybridIndex:
         for index in candidate_indices:
             item = self.text[index]
             lexical = self._bm25(q_tokens, self._text_tokens, self._text_df, self._text_avg_len, index)
+            # 提取当前证据中的百分比和数字
+            item_text = self._text_blob(item)
+            item_percentages, item_numbers = self._numeric_terms(item_text)
+
+            # 完整百分比匹配，例如问题和证据中都出现“35%”
+            percentage_matches = (
+                query_percentages & item_percentages
+            )
+
+            # 普通数字匹配，包括“35”和“35%”之间的匹配
+            number_matches = query_numbers & item_numbers
+
+            # 已经按照百分比计算过的数值，不重复计算普通数字分
+            percentage_values = {
+                value.rstrip("%")
+                for value in percentage_matches
+            }
+
+            plain_number_matches = (
+                number_matches - percentage_values
+            )
+
+            # 百分比辨识度较高，权重设为2；普通数字权重设为0.5
+            numeric_bonus = (
+                2.0 * len(percentage_matches)
+                + 0.5 * len(plain_number_matches)
+            )
+
+            lexical += numeric_bonus
             dense = vector_scores.get(str(item.get("evidence_id")), self._dense(query, self._text_blob(item))) if self.semantic else self._dense(query, self._text_blob(item))
             metadata = self._metadata(item, query, filters)
             if lexical or dense or metadata:
@@ -325,7 +382,7 @@ class HybridIndex:
             # paragraph records by DOC/PDF conversion.  A bounded window of
             # neighbouring records preserves the sentence without loading
             # unrelated parts of the document.
-            and abs(int(item["paragraph_no"]) - center) <= 3
+            and center - 6 <= int(item["paragraph_no"]) <= center + 3
         ]
         neighbours.sort(key=lambda item: int(item.get("paragraph_no") or 0))
         if neighbours:
@@ -733,9 +790,13 @@ def _canonical_label(value: Any) -> str:
 
 
 def _metadata_key(value: Any) -> str:
-    """Normalize harmless punctuation/layout differences in source hints."""
-    return re.sub(r"[^\w\u4e00-\u9fff]|_", "", normalize_text(value).lower())
-
+    """Normalize harmless source-title and filename variations."""
+    normalized = normalize_text(value).lower()
+    normalized = re.sub(r"[^\w\u4e00-\u9fff]|_", "", normalized)
+    # 文件标题中常见的非关键差异
+    normalized = normalized.replace("的", "")
+    normalized = normalized.replace("版", "")
+    return normalized
 
 def _calculation_columns(query: str) -> list[str]:
     """Return both quoted operands for table difference/change queries."""

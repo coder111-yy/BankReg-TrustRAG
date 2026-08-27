@@ -164,3 +164,26 @@ def test_regional_table_retrieval_matches_row_and_column_dimension():
     hits = index.hybrid_search(question, parsed.qa_type, top_k=3, filters={"file_name": parsed.entities["filenames"]})
 
     assert hits and hits[0].item["cell_address"] == "C4"
+
+def test_metadata_filter_ignores_minor_title_word_variants():
+    index = HybridIndex(
+        [{
+            "doc_id": "d1",
+            "title": "附件1：寿险合同负债评估的折现率曲线",
+            "file_name": "附件1：寿险合同负债评估的折现率曲线.pdf",
+        }],
+        [{
+            "evidence_id": "text:d1:p1",
+            "doc_id": "d1",
+            "paragraph_no": 1,
+            "content": "折现率曲线由基础利率曲线加综合溢价形成。",
+        }],
+        [],
+    )
+
+    hits = index.search_text(
+        "折现率曲线",
+        filters={"title": ["寿险合同负债评估折现率曲线"]},
+    )
+
+    assert hits
