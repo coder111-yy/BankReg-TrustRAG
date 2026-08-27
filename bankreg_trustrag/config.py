@@ -90,5 +90,5 @@ class Settings:
             llm_timeout_seconds=float(os.getenv("BANKREG_LLM_TIMEOUT_SECONDS", os.getenv("BANKREG_LLM_TIMEOUT", "45"))),
             llm_max_tokens=int(os.getenv("BANKREG_LLM_MAX_TOKENS", "800")),
             llm_temperature=float(os.getenv("BANKREG_LLM_TEMPERATURE", "0")),
-            llm_max_context_chars=int(os.getenv("BANKREG_LLM_MAX_CONTEXT_CHARS", os.getenv("BANKREG_CONTEXT_MAX_CHARS", "12000"))),
+            llm_max_context_chars=int(os.getenv("BANKREG_CONTEXT_MAX_CHARS", os.getenv("BANKREG_LLM_MAX_CONTEXT_CHARS", "12000"))),
         )
