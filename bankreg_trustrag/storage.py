@@ -342,6 +342,43 @@ class Store:
             result.append(item)
         return result
 
+    def delete_conversation(self, conversation_id: str, memory_scope_id: str) -> bool:
+        """Delete a conversation and all user-visible memory derived from it.
+
+        The scope check is part of the lookup, so a browser cannot delete a
+        conversation belonging to another local memory scope.  Audit records
+        created by the chat are removed through their message trace IDs; the
+        regulatory corpus is never touched.
+        """
+        conversation = self.get_conversation(conversation_id, memory_scope_id)
+        if conversation is None:
+            return False
+        trace_rows = self.connection.execute(
+            "SELECT trace_id FROM conversation_messages WHERE conversation_id=? AND trace_id IS NOT NULL",
+            (conversation_id,),
+        ).fetchall()
+        trace_ids = [str(row[0]) for row in trace_rows if row[0]]
+        with self.connection:
+            self.connection.execute(
+                "DELETE FROM long_term_memories WHERE conversation_id=? AND memory_scope_id=?",
+                (conversation_id, memory_scope_id),
+            )
+            self.connection.execute(
+                "DELETE FROM conversation_messages WHERE conversation_id=?",
+                (conversation_id,),
+            )
+            self.connection.execute(
+                "DELETE FROM conversations WHERE conversation_id=? AND memory_scope_id=?",
+                (conversation_id, memory_scope_id),
+            )
+            if trace_ids:
+                placeholders = ",".join("?" for _ in trace_ids)
+                self.connection.execute(
+                    f"DELETE FROM qa_records WHERE trace_id IN ({placeholders})",
+                    trace_ids,
+                )
+        return True
+
     def recent_conversation_messages(self, conversation_id: str, memory_scope_id: str, limit: int = 8) -> list[dict[str, Any]]:
         messages = self.conversation_messages(conversation_id, memory_scope_id, limit=200)
         return messages[-max(1, min(int(limit), 20)):]

@@ -16,7 +16,7 @@ from typing import Any
 from .query import extract_dimension_labels, extract_inline_choices
 from .retrieval.index import Hit, HybridIndex
 from .schemas import ParsedQuery
-from .utils import canonical_dimension_label, canonical_table_label, normalize_text, normalized_number, tokens
+from .utils import char_ngrams, canonical_dimension_label, canonical_table_label, normalize_text, normalized_number, tokens
 
 
 @dataclass(frozen=True)
@@ -206,10 +206,25 @@ def _claim_parts(option: str) -> list[str]:
     if not value:
         return []
     # Regulatory combination choices commonly contain two statements joined
-    # by a semicolon.  Keep commas intact because they often belong to one
-    # legal statement or a list of conditions.
+    # by a semicolon. Commas remain intact unless the statement is clearly a
+    # long list assembled from multiple source headings below.
     parts = [part.strip(" ：:，,；;。.!！？?\n\t") for part in re.split(r"[；;。！？!?]+", value)]
-    return [part for part in parts if part]
+    expanded: list[str] = []
+    for part in parts:
+        # A generated option can be a faithful list assembled from several
+        # source headings. Those headings are often stored in separate
+        # paragraphs, so treating the whole comma-delimited list as one claim
+        # makes a supported option look unsupported. Keep short prose intact
+        # and decompose only long, list-like statements.
+        if len(part) >= 48 and part.count("，") + part.count(",") + part.count("、") >= 4:
+            expanded.extend(
+                item.strip(" ：:，,、")
+                for item in re.split(r"[，,、]", part)
+                if item.strip(" ：:，,、")
+            )
+        else:
+            expanded.append(part)
+    return [part for part in expanded if part]
 
 
 def _hit_text(hit: Hit) -> str:
@@ -373,6 +388,21 @@ def _claim_support(claim: str, hit: Hit) -> float:
         return 0.0
     if normalized_claim in evidence:
         return 1.0
+    # Chinese character-token overlap overvalues generic characters such as
+    # ``公司`` and ``数据``.  For long legal statements, require contiguous
+    # character n-grams to agree; this keeps an unrelated paragraph from
+    # tying an option whose evidence is genuinely present.
+    if len(normalized_claim) >= 12:
+        claim_grams = char_ngrams(normalized_claim)
+        evidence_grams = char_ngrams(evidence)
+        gram_coverage = len(claim_grams & evidence_grams) / max(len(claim_grams), 1)
+        if gram_coverage >= 0.78:
+            return 0.9
+        if gram_coverage >= 0.58:
+            return 0.72
+        if gram_coverage >= 0.40:
+            return 0.5
+        return min(0.34, 0.18 * max(hit.rerank_score, hit.dense_score) + 0.05 * hit.lexical_score)
     target = set(tokens(normalized_claim))
     overlap = len(target.intersection(tokens(evidence))) / max(len(target), 1)
     if overlap >= 0.78:
@@ -474,7 +504,8 @@ def run_choice_agent(
             option_query = f"{question} 选项{label} “{option}”在“{comparison_column}”口径下"
         else:
             option_query = f"{question} 选项{label} {option}"
-        option_specific_hits = _agent_search(index, option_query, qa_type, max(4, min(top_k, 12)), filters, rerank=False, dense=False)
+        option_top_k = max(12, min(top_k * 4, 32))
+        option_specific_hits = _agent_search(index, option_query, qa_type, option_top_k, filters, rerank=False, dense=False)
         hits = _merge_option_hits(option_specific_hits, shared_hits)
         option_hits[option_index] = hits
         overall, minimum, evidence_ids = _option_support(option, hits)
@@ -515,7 +546,14 @@ def run_choice_agent(
         margin = float(best["score"]) - float(second_score)
         # A choice is answerable only when every statement in it has evidence
         # and the best option is meaningfully ahead of the alternatives.
-        if float(best["score"]) >= 0.60 and float(best["minimum_claim_score"]) >= 0.5 and margin >= 0.08:
+        strong_support = float(best["score"]) >= 0.85 and float(best["minimum_claim_score"]) >= 0.70
+        if (
+            strong_support and margin >= 0.05
+        ) or (
+            float(best["score"]) >= 0.60
+            and float(best["minimum_claim_score"]) >= 0.5
+            and margin + 1e-9 >= 0.08
+        ):
             selected_index = best_index
         else:
             human_in_loop = {

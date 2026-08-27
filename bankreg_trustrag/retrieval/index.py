@@ -5,7 +5,7 @@ import math
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from ..schemas import TableCellEvidence, TextEvidence
 from ..query import extract_dimension_labels, extract_indicator
@@ -66,10 +66,17 @@ class HybridIndex:
         tables: Iterable[dict[str, Any]],
         semantic: BGEPipeline | None = None,
         vector_dir: Any | None = None,
+        table_provider: Callable[..., list[Any]] | None = None,
+        table_count: int | None = None,
     ):
         self.documents = list(documents)
         self.text = list(text)
         self.tables = list(tables)
+        # Production corpora contain more than one million table cells.  Keep
+        # the SQLite-backed provider instead of materialising that corpus in
+        # Python; small in-memory fixtures continue to use ``tables``.
+        self._table_provider = table_provider
+        self._table_count = table_count
         self.semantic = semantic
         self._text_vector_index = (
             PersistentVectorIndex(semantic, vector_dir, "text")
@@ -136,9 +143,11 @@ class HybridIndex:
         return cls(
             [dict(x) for x in store.all_documents()],
             [dict(x) for x in store.all_text()],
-            [dict(x) for x in store.all_tables()],
+            [],
             semantic=semantic,
             vector_dir=vector_dir,
+            table_provider=lambda **kwargs: [dict(x) for x in store.table_candidates(**kwargs)],
+            table_count=store.table_count(),
         )
 
     @property
@@ -228,12 +237,12 @@ class HybridIndex:
             return 0.0
         doc = self.doc_by_id.get(str(item.get("doc_id")), {})
         score = 0.0
-        haystack = normalize_text(" ".join(str(doc.get(k) or "") for k in ["title", "file_name", "local_path", "authority", "document_type"])).lower()
+        haystack = _metadata_key(" ".join(str(doc.get(k) or "") for k in ["title", "file_name", "local_path", "authority", "document_type"]))
         for key, expected in filters.items():
             if expected in (None, "", []):
                 continue
             values = expected if isinstance(expected, list) else [expected]
-            if any(normalize_text(v).lower() in haystack for v in values):
+            if any(_metadata_key(v) in haystack for v in values):
                 score += 1.0
         return score / max(len(filters), 1)
 
@@ -251,13 +260,13 @@ class HybridIndex:
             ]
         matching_docs: list[str] = []
         for doc in source:
-            haystack = normalize_text(" ".join(str(doc.get(k) or "") for k in ["title", "file_name", "local_path", "authority", "document_type"])).lower()
+            haystack = _metadata_key(" ".join(str(doc.get(k) or "") for k in ["title", "file_name", "local_path", "authority", "document_type"]))
             matched = True
             for expected in filters.values():
                 if expected in (None, "", []):
                     continue
                 values = expected if isinstance(expected, list) else [expected]
-                if not any(normalize_text(value).lower() in haystack for value in values):
+                if not any(_metadata_key(value) in haystack for value in values):
                     matched = False
                     break
             if matched:
@@ -291,9 +300,42 @@ class HybridIndex:
             if lexical or dense or metadata:
                 hits.append(Hit("text", item, lexical, dense, metadata_score=metadata))
         self._rrf(hits)
-        return sorted(hits, key=lambda hit: hit.fused_score, reverse=True)[:top_k]
+        selected = sorted(hits, key=lambda hit: hit.fused_score, reverse=True)[:top_k]
+        for hit in selected:
+            self._attach_text_context_window(hit)
+        return selected
+
+    def _attach_text_context_window(self, hit: Hit) -> None:
+        """Join nearby paragraphs so a clause split by parsing remains auditable."""
+        if hit.kind != "text" or hit.item.get("context_window"):
+            return
+        paragraph = hit.item.get("paragraph_no")
+        doc_id = str(hit.item.get("doc_id") or "")
+        if paragraph is None or not doc_id:
+            return
+        try:
+            center = int(paragraph)
+        except (TypeError, ValueError):
+            return
+        neighbours = [
+            item for item in self.text
+            if str(item.get("doc_id") or "") == doc_id
+            and item.get("paragraph_no") is not None
+            # Long regulatory bullets are frequently split across several
+            # paragraph records by DOC/PDF conversion.  A bounded window of
+            # neighbouring records preserves the sentence without loading
+            # unrelated parts of the document.
+            and abs(int(item["paragraph_no"]) - center) <= 3
+        ]
+        neighbours.sort(key=lambda item: int(item.get("paragraph_no") or 0))
+        if neighbours:
+            hit.item["context_window"] = " ".join(
+                str(item.get("content") or "") for item in neighbours if item.get("content")
+            )
 
     def search_tables(self, query: str, top_k: int = 8, filters: dict[str, Any] | None = None) -> list[Hit]:
+        if self._table_provider is not None:
+            return self._search_tables_lazy(query, top_k, filters)
         q_tokens = tokens(query)
         candidate_indices = self._candidate_indices("table", filters)
         requested_indicator = extract_indicator(query)
@@ -523,6 +565,23 @@ class HybridIndex:
 
     def search_formula_evidence(self, indicator: str, top_k: int = 8, filters: dict[str, Any] | None = None, year: str | None = None) -> list[Hit]:
         """Retrieve formula cells that ordinary table top-k ranking can omit."""
+        if self._table_provider is not None:
+            items = self._lazy_table_candidates(indicator, filters, formula=True)
+            hits: list[Hit] = []
+            for item in items:
+                if year:
+                    source = normalize_text(" ".join(
+                        str(self.doc_by_id.get(str(item.get("doc_id")), {}).get(key) or "")
+                        for key in ("title", "file_name", "local_path")
+                    ))
+                    period = normalize_text(item.get("period"))
+                    if year not in source and not period.startswith(year):
+                        continue
+                blob = normalize_text(item.get("value_text")).replace("％", "%")
+                if "不良贷款余额" in blob and "各项贷款余额" in blob and "100%" in blob:
+                    hits.append(Hit("table", item, lexical_score=1.0, table_score=5.0))
+            self._rrf(hits)
+            return sorted(hits, key=lambda hit: (hit.table_score, hit.fused_score), reverse=True)[:top_k]
         allowed = set(self._candidate_indices("table", filters)) if filters else None
         hits: list[Hit] = []
         for index in self._formula_indices:
@@ -545,6 +604,89 @@ class HybridIndex:
             hits.append(Hit("table", item, lexical_score=1.0, metadata_score=metadata, table_score=5.0))
         self._rrf(hits)
         return sorted(hits, key=lambda hit: (hit.table_score, hit.metadata_score, hit.fused_score), reverse=True)[:top_k]
+
+    def _matching_doc_ids(self, filters: dict[str, Any] | None) -> list[str] | None:
+        """Resolve document filters without touching table evidence rows."""
+        if not filters:
+            return [
+                str(doc["doc_id"])
+                for doc in self.documents
+                if not self._is_benchmark_document(doc)
+            ]
+        matching: list[str] = []
+        for doc in self.documents:
+            haystack = _metadata_key(" ".join(
+                str(doc.get(key) or "")
+                for key in ("title", "file_name", "local_path", "authority", "document_type")
+            ))
+            if all(
+                expected in (None, "", [])
+                or any(_metadata_key(value) in haystack for value in (expected if isinstance(expected, list) else [expected]))
+                for expected in filters.values()
+            ):
+                matching.append(str(doc["doc_id"]))
+        return matching
+
+    def _lazy_table_candidates(
+        self,
+        query: str,
+        filters: dict[str, Any] | None,
+        *,
+        formula: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Fetch a bounded, high-recall candidate set from the SQLite store."""
+        if self._table_provider is None:
+            return [dict(item) for item in self.tables]
+        doc_ids = self._matching_doc_ids(filters)
+        if not doc_ids:
+            return []
+        indicator = extract_indicator(query)
+        row_label, _ = extract_dimension_labels(query)
+        periods: list[str] = []
+        month = re.search(r"(20\d{2})年\s*0?(\d{1,2})月", normalize_text(query))
+        if month:
+            periods.append(f"{month.group(1)}-{int(month.group(2)):02d}")
+        else:
+            year = re.search(r"(20\d{2})年", normalize_text(query))
+            if year:
+                periods.append(year.group(1))
+        collected: dict[str, dict[str, Any]] = {}
+
+        def fetch(**kwargs: Any) -> None:
+            for item in self._table_provider(doc_ids=doc_ids, limit=20000, **kwargs):
+                collected[str(item.get("evidence_id"))] = item
+
+        # Exact indicator/row and period predicates use SQLite indexes and
+        # cover normal table lookups.  Add broader scoped passes for tables
+        # whose indicator is stored in a neighbouring/header cell.
+        if indicator or row_label or periods:
+            fetch(indicator=indicator, periods=periods, row_label=row_label)
+            if indicator or row_label:
+                fetch(indicator=indicator, row_label=row_label)
+        else:
+            fetch()
+        if formula:
+            fetch(text_terms=["不良贷款余额", "各项贷款余额"])
+        if not collected:
+            fetch(text_terms=[term for term in re.findall(r"[\u4e00-\u9fffA-Za-z]{2,}", normalize_text(query))[:8]])
+        return list(collected.values())
+
+    def _search_tables_lazy(self, query: str, top_k: int, filters: dict[str, Any] | None) -> list[Hit]:
+        """Run the existing table scorer over only SQL-selected candidates."""
+        items = self._lazy_table_candidates(query, filters)
+        if not items:
+            return []
+        # Reuse the thoroughly tested in-memory scorer without rebuilding the
+        # million-cell corpus.  This temporary index contains only this query's
+        # bounded candidates and shares the already loaded semantic pipeline.
+        bounded = HybridIndex(
+            self.documents,
+            [],
+            items,
+            semantic=self.semantic,
+            vector_dir=None,
+        )
+        return bounded.search_tables(query, top_k, filters)
 
     @staticmethod
     def _rrf(hits: list[Hit], k: int = 60) -> None:
@@ -588,6 +730,11 @@ class HybridIndex:
 def _canonical_label(value: Any) -> str:
     """Normalize labels whose Excel cells contain layout decoration."""
     return canonical_table_label(value)
+
+
+def _metadata_key(value: Any) -> str:
+    """Normalize harmless punctuation/layout differences in source hints."""
+    return re.sub(r"[^\w\u4e00-\u9fff]|_", "", normalize_text(value).lower())
 
 
 def _calculation_columns(query: str) -> list[str]:

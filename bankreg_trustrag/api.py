@@ -5,8 +5,9 @@ import json
 import re
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
+from fastapi import Query
 from pydantic import BaseModel, Field
 
 from .config import Settings
@@ -66,6 +67,15 @@ def create_app(settings: Settings | None = None):
         if not service.store.get_conversation(conversation_id, scope):
             raise HTTPException(status_code=404, detail="conversation not found")
         return service.store.conversation_messages(conversation_id, scope, limit)
+
+    @app.delete("/api/conversations/{conversation_id}", status_code=204)
+    def delete_conversation(
+        conversation_id: str,
+        memory_scope_id: Annotated[str, Query(min_length=8, max_length=128)],
+    ) -> None:
+        scope = _safe_memory_scope(memory_scope_id)
+        if not service.store.delete_conversation(conversation_id, scope):
+            raise HTTPException(status_code=404, detail="conversation not found")
 
     @app.post("/api/chat/stream")
     async def chat_stream(request: ChatRequest):

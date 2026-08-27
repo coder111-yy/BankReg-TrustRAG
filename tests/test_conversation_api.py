@@ -53,6 +53,59 @@ def test_long_term_memory_recall_only_returns_matching_answered_exchange(tmp_pat
     assert [item["memory_id"] for item in recalled] == ["mem_one"]
 
 
+def test_delete_conversation_removes_messages_memories_and_chat_audit(tmp_path):
+    store = Store(tmp_path / "memory.sqlite3")
+    store.create_conversation("conv_delete", "browser_scope_one")
+    store.add_conversation_message(
+        "msg_delete", "conv_delete", "browser_scope_one", "assistant", "已回答",
+        trace_id="trace_delete",
+    )
+    store.remember_answer(
+        "mem_delete", "browser_scope_one", "conv_delete", "问题", "答案",
+        "regulatory_fact", "answer", [],
+    )
+    store.save_qa(
+        "trace_delete", "问题", "regulatory_fact", {}, [], "答案", 0.9,
+        {}, "answer", 10,
+    )
+
+    assert store.delete_conversation("conv_delete", "browser_scope_one") is True
+    assert store.get_conversation("conv_delete", "browser_scope_one") is None
+    assert store.conversation_messages("conv_delete", "browser_scope_one") == []
+    assert store.recall_memories("browser_scope_one", "问题") == []
+    assert store.history() == []
+    assert store.delete_conversation("conv_delete", "browser_scope_one") is False
+
+
+def test_delete_conversation_cannot_cross_memory_scope(tmp_path):
+    store = Store(tmp_path / "memory.sqlite3")
+    store.create_conversation("conv_scope", "browser_scope_one")
+
+    assert store.delete_conversation("conv_scope", "browser_scope_two") is False
+    assert store.get_conversation("conv_scope", "browser_scope_one") is not None
+
+
+def test_delete_conversation_endpoint_is_scope_protected(tmp_path):
+    client = TestClient(create_app(_settings(tmp_path)))
+    created = client.post(
+        "/api/conversations",
+        json={"memory_scope_id": "browser_api_scope", "title": "待删除"},
+    )
+    assert created.status_code == 200
+    conversation_id = created.json()["conversation_id"]
+
+    blocked = client.delete(
+        f"/api/conversations/{conversation_id}?memory_scope_id=browser_other_scope",
+    )
+    assert blocked.status_code == 404
+
+    deleted = client.delete(
+        f"/api/conversations/{conversation_id}?memory_scope_id=browser_api_scope",
+    )
+    assert deleted.status_code == 204
+    assert client.get("/api/conversations?memory_scope_id=browser_api_scope").json() == []
+
+
 def test_chat_stream_emits_public_workflow_status_and_answer(tmp_path):
     app = create_app(_settings(tmp_path))
     response = TestClient(app).post(
