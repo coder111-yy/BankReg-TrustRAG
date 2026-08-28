@@ -83,6 +83,27 @@ def test_text_retrieval_attaches_adjacent_clause_context():
     assert "直接发行且实缴" in hit.item["context_window"]
 
 
+def test_text_retrieval_context_keeps_complete_numbered_item_after_pdf_line_split():
+    index = HybridIndex(
+        [{"doc_id": "guide", "title": "银行函证工作操作指引", "file_name": "guide.pdf"}],
+        [
+            {"evidence_id": "text:guide:p55", "doc_id": "guide", "paragraph_no": 55, "content": "3.函证范围和回函用章。在实现集约化或数字化的情况"},
+            {"evidence_id": "text:guide:p56", "doc_id": "guide", "paragraph_no": 56, "content": "下,银行业金融机构应当就询证函的函证范围"},
+            {"evidence_id": "text:guide:p57", "doc_id": "guide", "paragraph_no": 57, "content": "以及所采用的回函用章的适用范围进行公示"},
+            {"evidence_id": "text:guide:p58", "doc_id": "guide", "paragraph_no": 58, "content": "说明可一并查询具体业务的最高机构层"},
+            {"evidence_id": "text:guide:p59", "doc_id": "guide", "paragraph_no": 59, "content": "级及回函用章。"},
+            {"evidence_id": "text:guide:p60", "doc_id": "guide", "paragraph_no": 60, "content": "4.回函服务的收费标准。"},
+        ],
+        [],
+    )
+
+    hit = index.search_text("函证范围和回函用章", top_k=1)[0]
+
+    assert hit.evidence_id == "text:guide:p55"
+    assert "最高机构层" in hit.item["context_window"]
+    assert "级及回函用章" in hit.item["context_window"]
+
+
 def test_benchmark_document_is_not_default_evidence():
     index = HybridIndex(
         [

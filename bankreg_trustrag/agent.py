@@ -475,17 +475,59 @@ def _option_support(option: str, hits: list[Hit]) -> tuple[float, float, list[st
     claim_scores: list[float] = []
     evidence_ids: list[str] = []
     for claim in claims:
-        ranked = sorted((( _claim_support(claim, hit), hit) for hit in hits), key=lambda item: item[0], reverse=True)
+        ranked = sorted(
+            ((_claim_hit_rank(claim, hit), hit) for hit in hits),
+            key=lambda item: item[0],
+            reverse=True,
+        )
         if ranked:
-            score, hit = ranked[0]
+            rank, hit = ranked[0]
+            score = rank[0]
             claim_scores.append(score)
             if score >= 0.5:
                 evidence_ids.append(hit.evidence_id)
+            # A statement such as “公示信息包括函证范围和回函用章”
+            # is often split into a list introduction and a numbered item,
+            # sometimes across PDF pages. Both records are required to prove
+            # the membership relation; either fragment alone is incomplete.
+            evidence_ids.extend(_list_membership_evidence_ids(claim, hits))
     if not claim_scores:
         return 0.0, 0.0, []
     overall = sum(claim_scores) / len(claim_scores)
     minimum = min(claim_scores)
     return overall, minimum, list(dict.fromkeys(evidence_ids))
+
+
+def _claim_hit_rank(claim: str, hit: Hit) -> tuple[float, float, float]:
+    support = _claim_support(claim, hit)
+    claim_grams = char_ngrams(claim)
+    content_grams = char_ngrams(str(hit.item.get("content") or hit.item.get("context") or ""))
+    direct_coverage = len(claim_grams & content_grams) / max(len(claim_grams), 1)
+    return support, direct_coverage, float(hit.fused_score)
+
+
+def _list_membership_evidence_ids(claim: str, hits: list[Hit]) -> list[str]:
+    """Link a list introduction with the numbered item supporting a claim."""
+    normalized = normalize_text(claim).strip("。；; ")
+    match = re.search(r"(.{4,}?)(?:包括|包含|涵盖|列示)(.{2,})", normalized)
+    if not match:
+        return []
+    introduction = match.group(1).strip(" ：:，,、")
+    member = match.group(2).strip(" ：:，,、")
+    if not introduction or not member:
+        return []
+
+    selected: list[str] = []
+    for part in (introduction, member):
+        ranked = sorted(
+            ((_claim_hit_rank(part, hit), hit) for hit in hits),
+            key=lambda item: item[0],
+            reverse=True,
+        )
+        if not ranked or ranked[0][0][0] < 0.70:
+            return []
+        selected.append(ranked[0][1].evidence_id)
+    return list(dict.fromkeys(selected))
 
 
 def _agent_search(

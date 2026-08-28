@@ -432,6 +432,62 @@ def test_service_uses_choice_agent_for_inline_options():
     assert response.query_plan["operations"][0]["evidence_explanations"][0]["evidence_id"] == "text:d1:p1"
 
 
+def test_choice_answer_links_list_introduction_to_numbered_item_across_pdf_lines():
+    index = HybridIndex(
+        [{
+            "doc_id": "guide",
+            "title": "银行函证工作操作指引",
+            "file_name": "银行函证工作操作指引.pdf",
+            "status": "effective",
+        }],
+        [
+            {"evidence_id": "text:guide:p34", "doc_id": "guide", "paragraph_no": 34, "page": 2, "content": "银行业金融机构应当在其总行或总部网站、微信公众号"},
+            {"evidence_id": "text:guide:p35", "doc_id": "guide", "paragraph_no": 35, "page": 2, "content": "等公开渠道就办理函证相关事项进行公示。银行业金融机构"},
+            {"evidence_id": "text:guide:p36", "doc_id": "guide", "paragraph_no": 36, "page": 2, "content": "公示的内容应当符合本指引具体要求。会计师事务所在此基"},
+            {"evidence_id": "text:guide:p37", "doc_id": "guide", "paragraph_no": 37, "page": 2, "content": "础上根据银行业金融机构公示信息进行函证。公示信息包括:"},
+            {"evidence_id": "text:guide:p49", "doc_id": "guide", "paragraph_no": 49, "page": 3, "content": "公示后,对于符合公示条件的申请,银行业金融机构不应拒"},
+            {"evidence_id": "text:guide:p50", "doc_id": "guide", "paragraph_no": 50, "page": 3, "content": "绝。公示的受理事项包括可以集中处理的第14项‘其他’"},
+            {"evidence_id": "text:guide:p51", "doc_id": "guide", "paragraph_no": 51, "page": 3, "content": "中的具体业务事项。"},
+            {"evidence_id": "text:guide:p55", "doc_id": "guide", "paragraph_no": 55, "page": 3, "content": "3.函证范围和回函用章。在实现集约化或数字化的情况"},
+            {"evidence_id": "text:guide:p56", "doc_id": "guide", "paragraph_no": 56, "page": 3, "content": "下,银行业金融机构应当就询证函的函证范围(即‘函证收"},
+            {"evidence_id": "text:guide:p57", "doc_id": "guide", "paragraph_no": 57, "page": 3, "content": "件人’可填写的总分支机构范围)以及所采用的回函用章的"},
+            {"evidence_id": "text:guide:p58", "doc_id": "guide", "paragraph_no": 58, "page": 3, "content": "适用范围进行公示,说明可一并查询具体业务的最高机构层"},
+            {"evidence_id": "text:guide:p59", "doc_id": "guide", "paragraph_no": 59, "page": 3, "content": "级及回函用章。"},
+            {"evidence_id": "text:guide:p60", "doc_id": "guide", "paragraph_no": 60, "page": 3, "content": "4.回函服务的收费标准。"},
+        ],
+        [],
+    )
+    service = TrustRAGService.__new__(TrustRAGService)
+    service.settings = SimpleNamespace(min_trust=0.58, top_k=8)
+    service.store = SimpleNamespace(save_qa=lambda *args: None)
+    service.index = index
+    service.semantic = SimpleNamespace(enabled=False)
+
+    response = service.ask(
+        "检索《银行函证工作操作指引》（PDF）后，以下哪一项与材料内容一致？"
+        "A.基础利率曲线为即期曲线。"
+        "B.750日移动平均国债收益率曲线适用于0年至20年的区间。"
+        "C.银行业金融机构公示信息包括函证范围和回函用章。"
+        "D.寿险合同负债评估中折现率曲线由基础利率曲线加综合溢价形成。"
+    )
+
+    assert response.answer.startswith("明确答案：选项 C")
+    assert "会计师事务所在此基础上" in response.answer
+    assert "公示信息包括：" in response.answer
+    assert "3.函证范围和回函用章" in response.answer
+    assert "最高机构层级及回函用章" in response.answer
+    assert response.query_plan["operations"][0]["display_evidence_ids"] == [
+        "text:guide:p37",
+        "text:guide:p55",
+    ]
+    assert [item["evidence_id"] for item in response.evidence] == [
+        "text:guide:p37",
+        "text:guide:p55",
+    ]
+    assert response.evidence[0]["display_content"].startswith("会计师事务所在此基础上")
+    assert response.evidence[1]["display_content"].startswith("3.函证范围和回函用章")
+
+
 def test_service_records_verification_retry_for_unconfirmed_current_version():
     class RetryIndex:
         doc_by_id = {"d1": {"title": "资本管理办法", "file_name": "rule.docx", "status": "unknown"}}

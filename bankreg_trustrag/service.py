@@ -15,7 +15,7 @@ from .retrieval.index import HybridIndex
 from .retrieval.bge import BGEConfig, BGEPipeline
 from .schemas import QAResponse
 from .storage import Store
-from .utils import normalize_text
+from .utils import char_ngrams, normalize_text
 from .verification import trust_decision, verify_claims
 
 
@@ -369,7 +369,7 @@ class TrustRAGService:
                 draft.answer = "当前证据存在不确定性，请补充文件、版本、时间或业务场景后再查询。"
         trace_id = "trace_" + uuid.uuid4().hex[:16]
         latency = int((time.perf_counter() - started) * 1000)
-        evidence = [hit.to_dict() for hit in display_hits]
+        evidence = _response_evidence(display_hits, draft.operations)
         retrieval_routes = ["bm25", "metadata"]
         semantic = getattr(self, "semantic", None)
         if semantic is not None and semantic.enabled:
@@ -512,7 +512,11 @@ def _choice_answer_draft(choice_result: Any) -> AnswerDraft:
                     "display_evidence_ids": selected.get("evidence_ids", []),
                 }],
             )
-        explanations = _choice_evidence_explanations(choice_result, selected.get("evidence_ids", []))
+        explanations = _choice_evidence_explanations(
+            choice_result,
+            selected.get("evidence_ids", []),
+            choice_result.choices[selected_index],
+        )
         answer = _render_grounded_choice_answer(
             label,
             choice_result.choices[selected_index],
@@ -521,7 +525,8 @@ def _choice_answer_draft(choice_result: Any) -> AnswerDraft:
         # Keep ordinary choice answers near the 80-200 Chinese-character
         # target. One core item is still a sufficient explanation when two
         # source excerpts would make the response unnecessarily long.
-        if len(answer) > 220 and len(explanations) > 1:
+        linked_list_evidence = {item.get("role") for item in explanations} >= {"list_introduction", "list_item"}
+        if len(answer) > 220 and len(explanations) > 1 and not linked_list_evidence:
             explanations = explanations[:1]
             answer = _render_grounded_choice_answer(
                 label,
@@ -562,6 +567,7 @@ def _choice_answer_draft(choice_result: Any) -> AnswerDraft:
 def _choice_evidence_explanations(
     choice_result: Any,
     evidence_ids: list[str],
+    focus_text: str,
     limit: int = 2,
 ) -> list[dict[str, str]]:
     by_id = {hit.evidence_id: hit for hit in choice_result.all_hits}
@@ -571,18 +577,8 @@ def _choice_evidence_explanations(
         if hit is None:
             continue
         item = hit.item
-        content = normalize_text(
-            item.get("content")
-            or item.get("context_window")
-            or item.get("context")
-            or " | ".join(
-                str(item.get(key) or "")
-                for key in ("indicator", "period", "row_header", "column_header", "value_text", "unit")
-                if item.get(key) not in (None, "")
-            )
-            or ""
-        )
-        if not content:
+        excerpt, role = _supporting_evidence_excerpt(item, focus_text)
+        if not excerpt:
             continue
         explanations.append({
             "evidence_id": evidence_id,
@@ -592,7 +588,8 @@ def _choice_evidence_explanations(
                 or item.get("table_name")
                 or "相关材料"
             )[:32],
-            "excerpt": _clip_answer_text(content, 64),
+            "excerpt": excerpt,
+            "role": role,
         })
         if len(explanations) >= limit:
             break
@@ -604,15 +601,96 @@ def _render_grounded_choice_answer(
     selected_text: str,
     explanations: list[dict[str, str]],
 ) -> str:
-    evidence_text = "；".join(
-        f"《{item['source']}》记载“{item['excerpt']}”"
-        for item in explanations
-    )
+    introduction = next((item for item in explanations if item.get("role") == "list_introduction"), None)
+    list_item = next((item for item in explanations if item.get("role") == "list_item"), None)
+    if introduction and list_item and introduction["source"] == list_item["source"]:
+        introduction_excerpt = introduction["excerpt"].rstrip("。")
+        list_item_excerpt = list_item["excerpt"].rstrip("。")
+        evidence_text = (
+            f"《{introduction['source']}》先说明“{introduction_excerpt}”，"
+            f"随后列明“{list_item_excerpt}”"
+        )
+    else:
+        evidence_text = "；".join(
+            f"《{item['source']}》记载“{item['excerpt']}”"
+            for item in explanations
+        )
     return (
         f"明确答案：选项 {label}（{_clip_answer_text(selected_text, 48)}）。"
         f"核心证据：{evidence_text}。"
         f"上述证据与选项 {label} 的关键陈述一致。最终结论：选择 {label}。"
     )
+
+
+def _supporting_evidence_excerpt(item: dict[str, Any], focus_text: str) -> tuple[str, str]:
+    content = _repair_pdf_line_wrap(item.get("content") or "")
+    context = _repair_pdf_line_wrap(
+        item.get("context_window")
+        or item.get("context")
+        or content
+    )
+    bullet = re.match(r"^\s*(\d{1,2})\s*[.．、]", content)
+    if bullet:
+        block = _numbered_item_block(context, bullet.group(1))
+        return _clip_evidence_text(block or content, 260), "list_item"
+    if any(marker in content for marker in ("包括:", "包括：", "包含:", "包含：", "列示:", "列示：")):
+        return _list_introduction_excerpt(context), "list_introduction"
+
+    candidates = [
+        part.strip()
+        for part in re.findall(r"[^。！？]+[。！？]?", context)
+        if part.strip()
+    ]
+    if candidates:
+        focus_grams = char_ngrams(focus_text)
+        best = max(
+            candidates,
+            key=lambda part: len(focus_grams & char_ngrams(part)) / max(len(focus_grams), 1),
+        )
+        return _clip_evidence_text(best, 160), "direct_support"
+    fallback = content or " | ".join(
+        str(item.get(key) or "")
+        for key in ("indicator", "period", "row_header", "column_header", "value_text", "unit")
+        if item.get(key) not in (None, "")
+    )
+    return _clip_evidence_text(fallback, 160), "direct_support"
+
+
+def _repair_pdf_line_wrap(value: Any) -> str:
+    text = normalize_text(value)
+    return re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])", "", text)
+
+
+def _list_introduction_excerpt(context: str) -> str:
+    marker = re.search(r"(?:包括|包含|列示)\s*[:：]", context)
+    if marker is None:
+        return _clip_evidence_text(context, 160)
+    prefix = context[:marker.end()]
+    sentences = [part for part in re.split(r"(?<=[。！？])", prefix) if part.strip()]
+    excerpt = "".join(sentences[-2:]) if len(sentences) >= 2 else prefix
+    return _clip_evidence_text(excerpt.replace(":", "："), 180)
+
+
+def _numbered_item_block(context: str, number: str) -> str:
+    start_match = re.search(rf"(?:^|\s){re.escape(number)}\s*[.．、]\s*", context)
+    if start_match is None:
+        return ""
+    start = start_match.start()
+    following = context[start_match.end():]
+    next_match = re.search(r"\s\d{1,2}\s*[.．、]\s*", following)
+    end = start_match.end() + next_match.start() if next_match else len(context)
+    return context[start:end].strip()
+
+
+def _clip_evidence_text(value: Any, limit: int) -> str:
+    text = _repair_pdf_line_wrap(value).strip(" ；;")
+    if len(text) <= limit:
+        return text.replace(":", "：")
+    clipped = text[:limit]
+    boundary = max(clipped.rfind(mark) for mark in "；。！？")
+    if boundary >= max(24, limit // 2):
+        clipped = clipped[:boundary + 1]
+    return (clipped.rstrip() + ("…" if len(clipped) < len(text) else "")).replace(":", "：")
 
 
 def _display_comparison_value(value: dict[str, Any], choice_result: Any) -> str:
@@ -884,6 +962,23 @@ def _multi_file_search(
         scoped_filters = {**common_filters, key: [value]}
         groups.append(index.hybrid_search(query, qa_type, max(top_k, 8), scoped_filters))
     return _merge_hits(*groups)
+
+
+def _response_evidence(hits: list[Any], operations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Overlay answer-specific complete excerpts without mutating the index."""
+    display_by_id = {
+        str(explanation.get("evidence_id")): str(explanation.get("excerpt") or "")
+        for operation in operations
+        for explanation in operation.get("evidence_explanations", [])
+        if explanation.get("evidence_id") and explanation.get("excerpt")
+    }
+    evidence: list[dict[str, Any]] = []
+    for hit in hits:
+        item = hit.to_dict()
+        if hit.evidence_id in display_by_id:
+            item["display_content"] = display_by_id[hit.evidence_id]
+        evidence.append(item)
+    return evidence
 
 
 def _answer_generation_strategy(operations: list[dict[str, Any]]) -> str:

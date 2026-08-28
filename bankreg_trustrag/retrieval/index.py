@@ -382,7 +382,7 @@ class HybridIndex:
             # paragraph records by DOC/PDF conversion.  A bounded window of
             # neighbouring records preserves the sentence without loading
             # unrelated parts of the document.
-            and center - 6 <= int(item["paragraph_no"]) <= center + 3
+            and center - 6 <= int(item["paragraph_no"]) <= center + 6
         ]
         neighbours.sort(key=lambda item: int(item.get("paragraph_no") or 0))
         if neighbours:
