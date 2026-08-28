@@ -82,6 +82,20 @@ class ParsedQuery:
     requires_table: bool = False
     requires_multi_hop: bool = False
     rewritten_queries: list[str] = field(default_factory=list)
+    # ``qa_type`` remains a compatibility/retrieval label.  The fields below
+    # describe what the user wants, how the answer should be returned, and
+    # which capabilities the workflow planner must compose.
+    intent: str = "lookup"
+    answer_format: str = "free_text"
+    requirements: dict[str, bool] = field(default_factory=lambda: {
+        "retrieval": True,
+        "multi_file": False,
+        "table": False,
+        "calculation": False,
+        "comparison": False,
+        "multi_hop": False,
+        "option_evaluation": False,
+    })
 
 
 @dataclass

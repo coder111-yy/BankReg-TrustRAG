@@ -73,6 +73,14 @@ def test_generator_sends_retrieved_context_to_chat_endpoint(monkeypatch):
     assert request["url"] == "http://127.0.0.1:9000/v1/chat/completions"
     assert "text:d1:p1" not in request["json"]["messages"][1]["content"]
     assert "商业银行不得挪用客户资金" in request["json"]["messages"][1]["content"]
+    system_prompt = request["json"]["messages"][0]["content"]
+    user_prompt = request["json"]["messages"][1]["content"]
+    assert "最小充分证据" in system_prompt
+    assert "明确反证" in system_prompt
+    assert "规则文件提供的规则、数据文件提供的数据、比较过程与最终结论" in system_prompt
+    assert "INTENT: lookup" in user_prompt
+    assert "ANSWER_FORMAT: free_text" in user_prompt
+    assert "REQUIREMENTS:" in user_prompt
     assert result.answer == "商业银行不得挪用客户资金。"
 
 

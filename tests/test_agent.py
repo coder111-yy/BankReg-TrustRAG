@@ -1,9 +1,10 @@
 from types import SimpleNamespace
 
-from bankreg_trustrag.agent import build_agent_workflow, organize_evidence, run_choice_agent
+from bankreg_trustrag.agent import build_agent_workflow, identify_intent, organize_evidence, run_choice_agent
 from bankreg_trustrag.query import extract_inline_choices, parse_query
 from bankreg_trustrag.retrieval.index import HybridIndex
 from bankreg_trustrag.retrieval.index import Hit
+from bankreg_trustrag.schemas import ParsedQuery
 from bankreg_trustrag.service import TrustRAGService
 
 
@@ -39,8 +40,69 @@ def test_agent_workflow_plans_cross_file_rule_table_and_verification_tasks():
     workflow = build_agent_workflow(parsed, parsed.original_query, [], {"title": ["商业银行主要监管指标情况表"]})
 
     task_ids = {task["id"] for task in workflow["tasks"]}
-    assert {"understand", "retrieve_primary", "retrieve_rule", "table_calculation", "generate", "verify"}.issubset(task_ids)
+    assert {"understand", "retrieve_primary", "table_operation", "generate", "verify"}.issubset(task_ids)
+    assert "retrieve_rule" not in task_ids
+    retrieval = next(task for task in workflow["tasks"] if task["id"] == "retrieve_primary")
+    assert retrieval["action"] == "hybrid_multi_file_retrieval_and_rerank"
+    assert retrieval["preserve_source_boundaries"] is True
+    assert workflow["intent"] == "judge"
+    assert workflow["answer_format"] == "free_text"
+    assert isinstance(workflow["intent"], str)
     assert workflow["question_understanding"]["requires_multi_hop"] is True
+
+
+def test_intent_answer_format_and_valid_choice_count_are_independent():
+    decision = identify_intent(
+        "根据表格比较哪一项数值最高？",
+        ["甲", " ", "", "乙"],
+        "table_lookup",
+    )
+
+    assert decision == {
+        "intent": "compare",
+        "answer_format": "multiple_choice",
+        "qa_type": "table_lookup",
+        "choice_count": 2,
+        "source": "explicit_options",
+    }
+
+
+def test_same_qa_type_can_build_different_workflows_from_requirements():
+    lookup = ParsedQuery(
+        "查询资本充足率规定",
+        "regulatory_fact",
+        requirements={
+            "retrieval": True,
+            "multi_file": False,
+            "table": False,
+            "calculation": False,
+            "comparison": False,
+            "multi_hop": False,
+            "option_evaluation": False,
+        },
+    )
+    comparison = ParsedQuery(
+        "比较两个表格中的资本充足率",
+        "regulatory_fact",
+        intent="compare",
+        requirements={
+            "retrieval": True,
+            "multi_file": True,
+            "table": True,
+            "calculation": True,
+            "comparison": True,
+            "multi_hop": True,
+            "option_evaluation": False,
+        },
+    )
+
+    lookup_tasks = {task["id"] for task in build_agent_workflow(lookup, lookup.original_query, [])["tasks"]}
+    comparison_workflow = build_agent_workflow(comparison, comparison.original_query, [])
+    comparison_tasks = {task["id"] for task in comparison_workflow["tasks"]}
+
+    assert "table_operation" not in lookup_tasks
+    assert "table_operation" in comparison_tasks
+    assert next(task for task in comparison_workflow["tasks"] if task["id"] == "retrieve_primary")["scope"] == "multi_file"
 
 
 def test_evidence_organization_keeps_statistical_role_when_cross_file_refuses():
@@ -135,9 +197,12 @@ def test_choice_agent_compares_table_column_values_and_accepts_total_alias():
         "A.全国总计 B.北京 C.天津 D.公司本级"
     )
 
-    assert response.answer == "选项 A：全国总计（在“健康险”口径下数值最高）。"
+    assert response.answer.startswith("明确答案：选项 A（全国总计）")
+    assert "A=8225.18，B=495.59，C=97.37，D=2.96" in response.answer
+    assert response.answer.endswith("最终结论：选择 A。")
     assert response.trust["decision"] == "answer"
     assert response.query_plan["agent"]["selected_option"] == "A"
+    assert response.query_plan["agent_workflow"]["answer_generation"]["strategy"] == "deterministic_table_comparison_explanation"
     assert [item["cell_address"] for item in response.evidence] == ["G4", "G6", "G7", "G5"]
 
 
@@ -255,7 +320,9 @@ def test_table_comparison_accepts_numbered_repeated_rows_when_winner_is_unambigu
     service.semantic = SimpleNamespace(enabled=False)
     response = service.ask(question + "A.人身险 B.原保险保费收入 C.总资产 D.财产险")
 
-    assert response.answer == "选项 C：总资产（在“本年累计/截至当期”口径下数值最高）。"
+    assert response.answer.startswith("明确答案：选项 C（总资产）")
+    assert "A=40895.45，B=52145.77，C=404005.89，D=11250.32" in response.answer
+    assert response.answer.endswith("最终结论：选择 C。")
     assert response.trust["decision"] == "answer"
     assert response.query_plan["agent"]["selected_option"] == "C"
 
@@ -276,6 +343,39 @@ def test_choice_agent_hands_off_when_no_option_has_evidence():
     assert result.selected_index is None
     assert result.human_in_loop is not None
     assert result.human_in_loop["status"] == "pending"
+
+
+def test_choice_agent_keeps_fifth_option_and_supports_legacy_search_fixture():
+    class LegacyIndex:
+        """Deliberately omits rerank/dense keyword parameters."""
+
+        def __init__(self):
+            self.calls = []
+
+        def hybrid_search(self, query, qa_type, top_k=8, filters=None):
+            self.calls.append(query)
+            if "选项E" in query:
+                return [Hit(
+                    "text",
+                    {"evidence_id": "text:d1:e", "content": "第五个正确答案"},
+                    lexical_score=2.0,
+                    fused_score=0.3,
+                )]
+            return []
+
+    index = LegacyIndex()
+    result = run_choice_agent(
+        index,
+        "关于银行监管要求，下列哪项正确？",
+        ["错误一", "错误二", "错误三", "错误四", "第五个正确答案"],
+        "regulatory_fact",
+    )
+
+    assert len(result.choices) == 5
+    assert len(result.option_hits) == 5
+    assert result.assessments[4]["label"] == "E"
+    assert result.selected_label == "E"
+    assert any("选项E" in query for query in index.calls)
 
 
 def test_choice_agent_accepts_two_supported_claims_at_boundary_score():
@@ -318,11 +418,18 @@ def test_service_uses_choice_agent_for_inline_options():
         "关于资金使用，下列哪项正确？A. 商业银行不得挪用客户资金；B. 商业银行可以挪用客户资金；C. 商业银行应当挪用客户资金；D. 商业银行可以随意使用客户资金"
     )
 
-    assert response.answer.startswith("选项 A")
+    assert response.answer.startswith("明确答案：选项 A")
+    assert "核心证据" in response.answer
+    assert "商业银行不得挪用客户资金" in response.answer
+    assert response.answer.endswith("最终结论：选择 A。")
+    assert "选项 B" not in response.answer
+    assert 80 <= len(response.answer) <= 220
     assert response.query_plan["agent"]["route"] == "choice_agent"
     assert response.query_plan["agent"]["selected_option"] == "A"
+    assert response.query_plan["agent_workflow"]["answer_generation"]["strategy"] == "evidence_grounded_choice_explanation"
     assert response.query_plan["agent_workflow"]["evidence_organization"]["items"][0]["role"] == "option_support"
     assert response.query_plan["operations"][0]["display_evidence_ids"] == ["text:d1:p1"]
+    assert response.query_plan["operations"][0]["evidence_explanations"][0]["evidence_id"] == "text:d1:p1"
 
 
 def test_service_records_verification_retry_for_unconfirmed_current_version():

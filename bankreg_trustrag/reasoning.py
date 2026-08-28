@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from .query import extract_dimension_labels, extract_indicator
+from .query import choice_index, choice_label, extract_dimension_labels, extract_indicator
 from .retrieval.index import Hit
 from .utils import (
     canonical_dimension_label,
@@ -205,7 +205,18 @@ def cross_file_answer(question: str, hits: list[Hit]) -> AnswerDraft:
     evidence_ids = list(dict.fromkeys(evidence_ids))
 
     if selected is None:
-        answer = f"当前证据中没有找到“{indicator}”对应的有效统计数值，无法判断是否满足监管要求，系统拒绝给出结论。"
+        rule_hit = threshold[2] if threshold else formula_hits[0] if formula_hits else None
+        rule_source = _evidence_source_name(rule_hit, "规则文件")
+        rule_side = (
+            f"规则侧：规则文件A（{rule_source}）提供了{indicator}相关规则或定义。"
+            if rule_hit is not None
+            else f"规则侧：当前未检索到{indicator}对应的可引用规则或阈值。"
+        )
+        answer = rule_side + (
+            f"数据侧：当前证据中没有找到“{indicator}”对应的有效统计数值。"
+            "比较过程：缺少可比较的实际值，无法执行阈值判断。"
+            "最终结论：证据不足，不能判断是否满足监管要求。"
+        )
         return AnswerDraft(answer, [], [{"type": "refusal", "source": None, "reason": "缺少统计表数值证据", "display_evidence_ids": evidence_ids}])
 
     raw_value = _load_table_value(selected.item.get("value_text"))
@@ -221,6 +232,9 @@ def cross_file_answer(question: str, hits: list[Hit]) -> AnswerDraft:
     if formula_hits:
         formula = _load_table_value(formula_hits[0].item.get("value_text"))
         formula = normalize_text(formula)
+    data_source = _evidence_source_name(selected, "数据文件")
+    rule_reference_hit = threshold[2] if threshold else formula_hits[0] if formula_hits else None
+    rule_source = _evidence_source_name(rule_reference_hit, "规则文件")
 
     operation: dict[str, Any] = {
         "type": "cross_file_judgment",
@@ -232,19 +246,28 @@ def cross_file_answer(question: str, hits: list[Hit]) -> AnswerDraft:
         "table_evidence_ids": [selected.evidence_id],
         "rule_evidence_ids": [hit.evidence_id for hit in formula_hits[:1]],
         "evidence_ids": evidence_ids,
+        "data_source": data_source,
+        "rule_source": rule_source,
     }
     if unit_inferred:
         operation["unit_source"] = "indicator_semantics"
     if formula:
         operation["formula"] = formula
     if numeric_value is None:
-        answer = f"{period}商业银行{indicator}为{display_value}。"
         claims = [f"{period}商业银行{indicator}为{display_value}。"]
         if formula:
-            answer += f"知识库中的指标解释给出的计算公式为“{formula}”。"
+            answer = f"规则文件A（{rule_source}）提供指标定义或计算公式：{formula}。"
             claims.append(f"计算公式为“{formula}”。")
-        answer += "但当前未检索到可引用的监管阈值，因此无法可靠判断是否满足监管要求，系统拒绝给出合规结论。"
-        operation.update({"type": "refusal", "reason": "缺少明确的监管阈值", "source": "监管指标解释", "display_evidence_ids": evidence_ids})
+        elif rule_reference_hit is not None:
+            answer = f"规则文件A（{rule_source}）提供了{indicator}相关规则，但没有形成可执行的数值阈值。"
+        else:
+            answer = f"规则侧：当前未检索到{indicator}对应的可引用规则或阈值。"
+        answer += (
+            f"数据文件B（{data_source}）提供数据：{period}商业银行{indicator}为{display_value}。"
+            "比较过程：该数据不是可用于阈值比较的有效数值。"
+            "最终结论：无法可靠判断是否满足监管要求。"
+        )
+        operation.update({"type": "refusal", "reason": "统计值不是可比较的有效数值", "source": data_source, "display_evidence_ids": evidence_ids})
         return AnswerDraft(answer, claims, [operation])
 
     if threshold:
@@ -253,21 +276,53 @@ def cross_file_answer(question: str, hits: list[Hit]) -> AnswerDraft:
         threshold_display = f"{threshold_value * 100:.3f}".rstrip("0").rstrip(".") + "%"
         operation.update({"threshold": threshold_display, "comparator": comparator, "threshold_evidence_id": threshold_hit.evidence_id, "rule_evidence_ids": [threshold_hit.evidence_id] + operation["rule_evidence_ids"]})
         conclusion = "满足监管要求" if ok else "不满足监管要求"
-        answer = f"{period}商业银行{indicator}为{display_value}，监管要求为{indicator}{wording}{threshold_display}，因此{conclusion}。"
+        relation = _comparison_relation_text(display_value, comparator, threshold_display, ok)
+        answer = (
+            f"规则文件A（{rule_source}）提供规则：{indicator}{wording}{threshold_display}。"
+            f"数据文件B（{data_source}）提供数据：{period}商业银行{indicator}为{display_value}。"
+            f"比较过程：{relation}。"
+            f"最终结论：{conclusion}。"
+        )
         claims = [f"{period}商业银行{indicator}为{display_value}。", f"监管要求为{indicator}{wording}{threshold_display}。"]
         if formula:
             answer += f"计算依据：{formula}。"
             claims.append(f"计算依据为“{formula}”。")
         return AnswerDraft(answer, claims, [operation])
 
-    answer = f"{period}商业银行{indicator}为{display_value}。"
-    claims = [answer]
+    claims = [f"{period}商业银行{indicator}为{display_value}。"]
     if formula:
-        answer += f"计算依据：{formula}。"
+        answer = f"规则文件A（{rule_source}）提供指标定义或计算公式：{formula}。"
         claims.append(f"计算依据为“{formula}”。")
-    answer += "但当前未检索到可引用的监管阈值，因此无法可靠判断是否满足监管要求，系统拒绝给出合规结论。"
+    elif rule_reference_hit is not None:
+        answer = f"规则文件A（{rule_source}）提供了{indicator}相关规则，但未包含明确监管阈值。"
+    else:
+        answer = f"规则侧：当前未检索到{indicator}对应的可引用规则或阈值。"
+    answer += (
+        f"数据文件B（{data_source}）提供数据：{period}商业银行{indicator}为{display_value}。"
+        "比较过程：因缺少明确监管阈值，无法完成规则与实际值的比较。"
+        "最终结论：不能可靠判断是否满足监管要求。"
+    )
     operation.update({"type": "refusal", "reason": "缺少明确的监管阈值", "source": "监管指标解释", "display_evidence_ids": evidence_ids})
     return AnswerDraft(answer, claims, [operation])
+
+
+def _evidence_source_name(hit: Hit | None, fallback: str) -> str:
+    if hit is None:
+        return fallback
+    return normalize_text(
+        hit.item.get("source_title")
+        or hit.item.get("source_file_name")
+        or hit.item.get("table_name")
+        or fallback
+    )
+
+
+def _comparison_relation_text(value: str, comparator: str, threshold: str, ok: bool) -> str:
+    symbol = {"<=": "≤", "<": "<", ">=": "≥", ">": ">"}.get(comparator, comparator)
+    if ok:
+        return f"实际值{value}{symbol}{threshold}，符合规则限定"
+    inverse = {"<=": ">", "<": "≥", ">=": "<", ">": "≤"}.get(comparator, "不符合")
+    return f"实际值{value}{inverse}{threshold}，不符合规则限定"
 
 
 def _option_texts(choices: list[str] | None) -> list[str]:
@@ -364,7 +419,7 @@ def choose_option(question: str, choices: list[str], hits: list[Hit]) -> tuple[s
     margin = scores[0][1] - (scores[1][1] if len(scores) > 1 else 0)
     confidence = min(1.0, 0.4 + scores[0][1] / 2 + max(margin, 0) / 2)
     evidence = [{"choice_index": i, "score": round(s, 6)} for i, s in scores]
-    return "ABCD"[scores[0][0]] if scores[0][0] < 4 else None, confidence, evidence
+    return choice_label(scores[0][0]), confidence, evidence
 
 
 def _is_table_calculation_question(question: str) -> bool:
@@ -465,7 +520,7 @@ def table_answer(question: str, choices: list[str] | None, hits: list[Hit]) -> A
     if choices:
         option, confidence = choose_table_option(question, choices, table_hits)
         if option:
-            selected = choices["ABCD".index(option)]
+            selected = choices[choice_index(option)]
             return AnswerDraft(f"选项 {option}：{selected}", [selected], [{"type": "table_lookup", "confidence": confidence}])
     if not table_hits:
         return AnswerDraft("当前证据不足，无法可靠回答。", [], [])
@@ -633,7 +688,7 @@ def _canonical_label(value: Any) -> str:
 def choose_table_option(question: str, choices: list[str], hits: list[Hit]) -> tuple[str | None, float]:
     """Choose the option whose exact value is in the most query-relevant cell."""
     scores: list[tuple[int, float]] = []
-    for index, choice in enumerate(choices[:4]):
+    for index, choice in enumerate(choices):
         target = normalized_number(choice)
         best = 0.0
         for hit in hits:
@@ -653,7 +708,7 @@ def choose_table_option(question: str, choices: list[str], hits: list[Hit]) -> t
     if not scores or scores[0][1] <= 0:
         return None, 0.0
     margin = scores[0][1] - (scores[1][1] if len(scores) > 1 else 0)
-    return "ABCD"[scores[0][0]], min(1.0, 0.65 + max(0.0, margin) / 2)
+    return choice_label(scores[0][0]), min(1.0, 0.65 + max(0.0, margin) / 2)
 
 
 def text_answer(question: str, choices: list[str] | None, hits: list[Hit]) -> AnswerDraft:
@@ -666,7 +721,7 @@ def text_answer(question: str, choices: list[str] | None, hits: list[Hit]) -> An
     if choices:
         option, confidence, _ = choose_option(question, choices, hits)
         if option:
-            selected = choices["ABCD".index(option)]
+            selected = choices[choice_index(option)]
             return AnswerDraft(f"选项 {option}：{selected}", [selected], [{"type": "evidence_choice", "confidence": confidence}])
     if not hits:
         return AnswerDraft("当前证据不足，无法可靠回答。", [], [])
@@ -680,9 +735,22 @@ def _hit_text(hit: Hit) -> str:
     return " ".join(str(item.get(k) or "") for k in ["content", "context", "_section_scope", "indicator", "period", "value_text", "row_header", "column_header"])
 
 
-def reason(question: str, qa_type: str, choices: list[str] | None, hits: list[Hit]) -> AnswerDraft:
-    if qa_type == "cross_file_judgment":
+def reason(
+    question: str,
+    qa_type: str,
+    choices: list[str] | None,
+    hits: list[Hit],
+    *,
+    intent: str | None = None,
+    requirements: dict[str, bool] | None = None,
+) -> AnswerDraft:
+    """Select deterministic reasoning from capabilities, with qa_type fallback."""
+    needs = requirements or {}
+    semantic_intent = intent or ("judge" if qa_type == "cross_file_judgment" else "lookup")
+    needs_table = bool(needs.get("table", qa_type in {"table_lookup", "cross_file_judgment"}))
+    needs_multi_file = bool(needs.get("multi_file", qa_type == "cross_file_judgment"))
+    if needs_table and needs_multi_file and semantic_intent in {"judge", "verify"}:
         return cross_file_answer(question, hits)
-    if qa_type == "table_lookup":
+    if needs_table:
         return table_answer(question, choices, hits)
     return text_answer(question, choices, hits)

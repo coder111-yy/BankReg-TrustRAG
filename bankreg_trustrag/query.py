@@ -57,7 +57,44 @@ OUT_OF_SCOPE_TERMS = (
 )
 
 
-CHOICE_LABEL_RE = re.compile(r"(?<![A-Za-z0-9])([A-DＡ-Ｄ])\s*[\.．、,，:：\)）]\s*", re.IGNORECASE)
+CHOICE_LABEL_RE = re.compile(r"(?<![A-Za-z0-9])([A-ZＡ-Ｚ])\s*[\.．、,，:：\)）]\s*", re.IGNORECASE)
+
+REQUIREMENT_KEYS = (
+    "retrieval",
+    "multi_file",
+    "table",
+    "calculation",
+    "comparison",
+    "multi_hop",
+    "option_evaluation",
+)
+
+
+def valid_choices(choices: list[str] | None) -> list[str]:
+    """Return the single normalized option list used by routing and agents."""
+    return [normalize_text(item) for item in (choices or []) if normalize_text(item)]
+
+
+def choice_label(index: int) -> str:
+    """Return spreadsheet-style labels (A..Z, AA..) without silent truncation."""
+    if index < 0:
+        raise ValueError("choice index must be non-negative")
+    label = ""
+    value = index + 1
+    while value:
+        value, remainder = divmod(value - 1, 26)
+        label = chr(ord("A") + remainder) + label
+    return label
+
+
+def choice_index(label: str) -> int:
+    normalized = normalize_text(label).upper()
+    if not normalized or not re.fullmatch(r"[A-Z]+", normalized):
+        raise ValueError(f"invalid choice label: {label}")
+    value = 0
+    for char in normalized:
+        value = value * 26 + ord(char) - ord("A") + 1
+    return value - 1
 
 
 def classify_question_scope(question: str) -> dict[str, Any]:
@@ -102,7 +139,7 @@ def classify_question_scope(question: str) -> dict[str, Any]:
 
 
 def extract_inline_choices(question: str) -> tuple[str, list[str]]:
-    """Extract A/B/C/D options pasted into the question box.
+    """Extract ordered A-Z options pasted into the question box.
 
     The web UI intentionally accepts a single free-text question.  Evaluation
     rows, however, keep the stem and options in separate columns, so the
@@ -116,8 +153,9 @@ def extract_inline_choices(question: str) -> tuple[str, list[str]]:
         return text, []
     # Only accept an ordered option block.  This prevents a stray ``A.`` in
     # the stem followed by a later ``B.`` from destroying the query.
-    labels = [match.group(1).upper().translate(str.maketrans("ＡＢＣＤ", "ABCD")) for match in matches]
-    if labels != sorted(labels, key="ABCD".index) or len(set(labels)) != len(labels):
+    labels = [normalize_text(match.group(1)).upper() for match in matches]
+    indices = [choice_index(label) for label in labels]
+    if indices != list(range(indices[0], indices[0] + len(indices))) or indices[0] != 0:
         return text, []
     stem = text[: matches[0].start()].strip(" ：:，,；;\n\t")
     choices: list[str] = []
@@ -128,7 +166,122 @@ def extract_inline_choices(question: str) -> tuple[str, list[str]]:
             choices.append(value)
     if len(choices) < 2:
         return text, []
-    return stem, choices
+    return stem, valid_choices(choices)
+
+
+def infer_answer_format(question: str, choices: list[str] | None = None) -> str:
+    """Infer the requested presentation independently from semantic intent."""
+    normalized = normalize_text(question)
+    options = valid_choices(choices)
+    if len(options) >= 2:
+        return "multiple_choice"
+    if any(term in normalized for term in ("JSON", "结构化", "字段", "表格形式", "列表形式")):
+        return "structured"
+    if any(term in normalized for term in ("只返回数字", "仅返回数字", "数值结果", "计算结果")):
+        return "number"
+    if any(term in normalized for term in ("是多少", "哪一项", "哪个", "查询", "查找", "列出")):
+        return "short_answer"
+    return "free_text"
+
+
+def infer_intent(question: str, qa_type: str, choices: list[str] | None = None) -> str:
+    """Classify the user's goal into a small, composable intent vocabulary."""
+    normalized = normalize_text(question)
+    # Summary takes precedence over comparison because questions such as
+    # “总结三份文件有什么不同” request a synthesis, not a single winner.
+    if any(term in normalized for term in ("总结", "汇总", "归纳", "概括", "综述")):
+        return "summarize"
+    if any(term in normalized for term in ("核验", "验证", "查证", "确认是否真实", "确认是否一致")):
+        return "verify"
+    if any(term in normalized for term in ("判断", "是否达标", "是否合规", "是否符合", "是否满足", "满足监管要求")):
+        return "judge"
+    if any(term in normalized for term in ("最高", "最低", "最大", "最小", "最多", "最少", "比较", "对比", "相比", "差异", "有什么不同")):
+        return "compare"
+    if any(term in normalized for term in ("计算", "求和", "合计", "平均", "差值", "差额", "增长率", "增幅", "加总")):
+        return "calculate"
+    if any(term in normalized for term in ("解释", "说明", "为什么", "原因", "含义", "口径是什么")):
+        return "explain"
+    # The legacy category is a fallback hint only; it never determines the
+    # whole workflow.  It preserves sensible behavior for terse benchmark rows.
+    if qa_type == "cross_file_judgment":
+        return "judge"
+    return "lookup"
+
+
+def infer_requirements(
+    question: str,
+    qa_type: str,
+    entities: dict[str, Any],
+    intent: str,
+    answer_format: str,
+) -> dict[str, bool]:
+    """Infer capabilities from language, extracted structure and source scope."""
+    normalized = normalize_text(question)
+    filenames = list(entities.get("filenames") or [])
+    title_hints = list(entities.get("title_hints") or [])
+    source_count = len(dict.fromkeys([*filenames, *title_hints]))
+    plural_source_language = bool(re.search(
+        r"(?:两|二|三|四|五|多|各)\s*(?:份|个)?\s*(?:文件|文档|材料|报表|表格)|跨文件|多个文件|多份文件|分别检索",
+        normalized,
+    ))
+    has_rule_language = any(term in normalized for term in (
+        "监管规定", "监管制度", "监管要求", "最低比例", "最高比例", "阈值", "规则", "办法", "条款",
+    ))
+    has_data_language = any(term in normalized for term in (
+        "Excel", "xlsx", "xls", "统计表", "报表", "实际数据", "表中", "单元格", "Sheet",
+    ))
+    multi_file = bool(
+        source_count >= 2
+        or plural_source_language
+        or (has_rule_language and has_data_language)
+        or qa_type == "cross_file_judgment"
+    )
+    table = bool(
+        qa_type == "table_lookup"
+        or any(entities.get(key) for key in ("table_name", "row_label", "column_label"))
+        or has_data_language
+    )
+    comparison = bool(
+        intent in {"compare", "judge", "verify"}
+        or any(term in normalized for term in ("超过", "低于", "高于", "不低于", "不高于", "达标", "相比", "不同", "差异", "异同", "区别"))
+    )
+    calculation = bool(
+        intent == "calculate"
+        or any(term in normalized for term in ("计算", "差值", "差额", "增长率", "增幅", "求和", "平均", "最高", "最低", "最大", "最小"))
+        or (table and comparison and intent in {"compare", "judge", "verify"})
+    )
+    option_evaluation = answer_format == "multiple_choice"
+    multi_hop = bool(
+        multi_file
+        or qa_type == "cross_file_judgment"
+        or (has_rule_language and has_data_language)
+    )
+    return {
+        "retrieval": True,
+        "multi_file": multi_file,
+        "table": table,
+        "calculation": calculation,
+        "comparison": comparison,
+        "multi_hop": multi_hop,
+        "option_evaluation": option_evaluation,
+    }
+
+
+def enrich_parsed_query(parsed: ParsedQuery, question: str, choices: list[str] | None = None) -> ParsedQuery:
+    """Populate the new understanding fields while preserving legacy fields."""
+    options = valid_choices(choices)
+    parsed.intent = infer_intent(question, parsed.qa_type, options)
+    parsed.answer_format = infer_answer_format(question, options)
+    parsed.requirements = infer_requirements(
+        question,
+        parsed.qa_type,
+        parsed.entities,
+        parsed.intent,
+        parsed.answer_format,
+    )
+    parsed.requires_table = parsed.requirements["table"]
+    parsed.requires_multi_hop = parsed.requirements["multi_hop"]
+    return parsed
 
 
 def _contains(text: str, values: tuple[str, ...]) -> bool:
@@ -238,7 +391,9 @@ def period_details(text: str) -> tuple[str | None, str | None, str | None]:
 
 
 def parse_query(question: str, choices: list[str] | None = None) -> ParsedQuery:
-    text = normalize_text(question)
+    inline_stem, inline_choices = extract_inline_choices(question)
+    effective_choices = valid_choices(choices or inline_choices)
+    text = normalize_text(inline_stem if inline_choices else question)
     qa_type = "regulatory_fact"
     if _contains(text, ("Excel", "表", "指标", "数值", "多少", "余额", "收入", "资产", "负债", "比例", "率")) and re.search(r"20\d{2}|季度|月份|月度", text):
         qa_type = "table_lookup"
@@ -283,9 +438,13 @@ def parse_query(question: str, choices: list[str] | None = None) -> ParsedQuery:
     if column_label:
         entities["column_label"] = column_label
     entities["filenames"] = _extract_filenames(text)
-    requires_table = qa_type in {"table_lookup", "cross_file_judgment"}
-    requires_multi_hop = qa_type == "cross_file_judgment"
     rewritten = [text]
-    if requires_table:
+    if qa_type in {"table_lookup", "cross_file_judgment"}:
         rewritten.append(text.replace("Excel", "").replace("表中", "表"))
-    return ParsedQuery(text, qa_type, entities, requires_table, requires_multi_hop, rewritten)
+    parsed = ParsedQuery(
+        original_query=text,
+        qa_type=qa_type,
+        entities=entities,
+        rewritten_queries=rewritten,
+    )
+    return enrich_parsed_query(parsed, text, effective_choices)

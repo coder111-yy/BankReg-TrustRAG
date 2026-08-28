@@ -13,7 +13,16 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from .query import extract_dimension_labels, extract_inline_choices
+from .query import (
+    REQUIREMENT_KEYS,
+    choice_label,
+    extract_dimension_labels,
+    extract_inline_choices,
+    infer_answer_format,
+    infer_intent,
+    infer_requirements,
+    valid_choices,
+)
 from .retrieval.index import Hit, HybridIndex
 from .schemas import ParsedQuery
 from .utils import char_ngrams, canonical_dimension_label, canonical_table_label, normalize_text, normalized_number, tokens
@@ -28,12 +37,13 @@ class ChoiceAgentResult:
     assessments: list[dict[str, Any]]
     selected_index: int | None
     human_in_loop: dict[str, Any] | None
+    answer_format: str = "multiple_choice"
 
     @property
     def selected_label(self) -> str | None:
-        if self.selected_index is None or self.selected_index >= 4:
+        if self.selected_index is None or self.selected_index >= len(self.choices):
             return None
-        return "ABCD"[self.selected_index]
+        return choice_label(self.selected_index)
 
     @property
     def all_hits(self) -> list[Hit]:
@@ -48,6 +58,7 @@ class ChoiceAgentResult:
     def to_plan(self) -> dict[str, Any]:
         return {
             "intent": self.intent,
+            "answer_format": self.answer_format,
             "route": "choice_agent",
             "question": self.question,
             "options": self.assessments,
@@ -56,14 +67,25 @@ class ChoiceAgentResult:
         }
 
 
-def identify_intent(question: str, choices: list[str] | None, qa_type: str) -> dict[str, Any]:
+def identify_intent(
+    question: str,
+    choices: list[str] | None,
+    qa_type: str,
+    parsed: ParsedQuery | None = None,
+) -> dict[str, Any]:
     """Return an auditable intent decision, without generating a conclusion."""
-    is_choice = len([item for item in (choices or []) if normalize_text(item)]) >= 2
+    _, inline_choices = extract_inline_choices(question)
+    options = valid_choices(choices or inline_choices)
+    inferred_intent = infer_intent(question, qa_type, options)
+    inferred_format = infer_answer_format(question, options)
+    intent = parsed.intent if parsed and parsed.intent != "lookup" else inferred_intent
+    answer_format = parsed.answer_format if parsed and parsed.answer_format != "free_text" else inferred_format
     return {
-        "intent": "multiple_choice" if is_choice else qa_type,
+        "intent": intent,
+        "answer_format": answer_format,
         "qa_type": qa_type,
-        "choice_count": len(choices or []),
-        "source": "explicit_options" if choices else "inline_option_parser" if extract_inline_choices(question)[1] else "query_router",
+        "choice_count": len(options),
+        "source": "explicit_options" if valid_choices(choices) else "inline_option_parser" if inline_choices else "query_router",
     }
 
 
@@ -79,7 +101,19 @@ def build_agent_workflow(
     exposes hidden reasoning, but makes Query/Retrieval/Table/Generation/
     Verification responsibilities reproducible from the API response.
     """
-    intent = identify_intent(question, choices, parsed.qa_type)
+    options = valid_choices(choices)
+    intent_decision = identify_intent(question, options, parsed.qa_type, parsed)
+    inferred_requirements = infer_requirements(
+        question,
+        parsed.qa_type,
+        parsed.entities,
+        intent_decision["intent"],
+        intent_decision["answer_format"],
+    )
+    requirements = {
+        key: bool((parsed.requirements or {}).get(key, False) or inferred_requirements[key])
+        for key in REQUIREMENT_KEYS
+    }
     tasks: list[dict[str, Any]] = [
         {
             "id": "understand",
@@ -88,51 +122,54 @@ def build_agent_workflow(
             "status": "completed",
             "output": {
                 "qa_type": parsed.qa_type,
+                "intent": intent_decision["intent"],
+                "answer_format": intent_decision["answer_format"],
+                "requirements": requirements,
                 "entities": parsed.entities,
                 "rewritten_queries": parsed.rewritten_queries,
             },
-        },
-        {
+        }
+    ]
+    if requirements["retrieval"]:
+        tasks.append({
             "id": "retrieve_primary",
             "agent": "Retrieval Agent",
-            "action": "hybrid_retrieval_and_rerank",
+            "action": "hybrid_multi_file_retrieval_and_rerank" if requirements["multi_file"] else "hybrid_retrieval_and_rerank",
             "status": "planned",
             "routes": ["bm25", "bge_vector", "metadata"],
             "filters": filters or {},
-        },
-    ]
-    if parsed.qa_type == "table_lookup":
-        tasks.append({
-            "id": "table_lookup",
-            "agent": "Table Agent",
-            "action": "locate_indicator_period_cell",
-            "status": "planned",
-            "inputs": {key: parsed.entities.get(key) for key in ["indicator", "period", "row_label", "column_label"]},
+            "scope": "multi_file" if requirements["multi_file"] else "single_file",
+            "preserve_source_boundaries": requirements["multi_file"],
         })
-    elif parsed.qa_type == "cross_file_judgment":
-        tasks.extend([
-            {
-                "id": "retrieve_rule",
-                "agent": "Retrieval Agent",
-                "action": "retrieve_rule_threshold_and_definition",
-                "status": "planned",
-                "routes": ["bm25", "bge_vector", "metadata"],
-            },
-            {
-                "id": "table_calculation",
-                "agent": "Table Agent",
-                "action": "locate_value_and_compare_deterministically",
-                "status": "planned",
-                "inputs": {key: parsed.entities.get(key) for key in ["indicator", "period", "table_name"]},
-            },
-        ])
-    if len(choices) >= 2:
+    if requirements["table"]:
+        if requirements["comparison"]:
+            table_action = "locate_cells_and_compare_deterministically"
+        elif requirements["calculation"]:
+            table_action = "locate_cells_and_calculate_deterministically"
+        else:
+            table_action = "locate_indicator_period_cell"
+        tasks.append({
+            "id": "table_operation",
+            "agent": "Table Agent",
+            "action": table_action,
+            "status": "planned",
+            "scope": "multi_file" if requirements["multi_file"] else "single_file",
+            "inputs": {key: parsed.entities.get(key) for key in ["indicator", "period", "row_label", "column_label", "table_name"]},
+        })
+    elif requirements["calculation"]:
+        tasks.append({
+            "id": "deterministic_calculation",
+            "agent": "Calculation Agent",
+            "action": "calculate_from_grounded_values",
+            "status": "planned",
+        })
+    if requirements["option_evaluation"]:
         tasks.append({
             "id": "evaluate_options",
             "agent": "Choice Agent",
             "action": "retrieve_each_option_independently",
             "status": "planned",
-            "option_count": len(choices),
+            "option_count": len(options),
         })
     tasks.extend([
         {
@@ -140,6 +177,7 @@ def build_agent_workflow(
             "agent": "Generation Agent",
             "action": "grounded_answer_from_minimal_evidence",
             "status": "planned",
+            "answer_format": intent_decision["answer_format"],
         },
         {
             "id": "verify",
@@ -149,12 +187,15 @@ def build_agent_workflow(
         },
     ])
     return {
-        "intent": intent,
+        "intent": intent_decision["intent"],
+        "answer_format": intent_decision["answer_format"],
+        "intent_decision": intent_decision,
         "question_understanding": {
             "qa_type": parsed.qa_type,
             "entities": parsed.entities,
-            "requires_table": parsed.requires_table,
-            "requires_multi_hop": parsed.requires_multi_hop,
+            "requirements": requirements,
+            "requires_table": requirements["table"],
+            "requires_multi_hop": requirements["multi_hop"],
         },
         "tasks": tasks,
     }
@@ -289,7 +330,7 @@ def _table_comparison_result(
         return None
 
     option_candidates: list[list[dict[str, Any]]] = []
-    for option_index, option in enumerate(choices[:4]):
+    for option_index, option in enumerate(choices):
         option_key = canonical_table_label(option)
         candidates: list[tuple[Hit, float]] = []
         for hit in option_hits.get(option_index, []):
@@ -355,7 +396,7 @@ def _table_comparison_result(
             chosen = max(candidates, key=lambda item: item["value"]) if option_index == selected_index else min(candidates, key=lambda item: item["value"])
         values.append({
             "choice_index": option_index,
-            "label": "ABCD"[option_index],
+            "label": choice_label(option_index),
             "text": choices[option_index],
             **chosen,
             "candidate_values": candidates,
@@ -481,18 +522,24 @@ def run_choice_agent(
     qa_type: str,
     filters: dict[str, Any] | None = None,
     top_k: int = 8,
+    *,
+    intent: str | None = None,
+    requires_table: bool | None = None,
 ) -> ChoiceAgentResult:
     """Retrieve each choice independently with one shared BGE rerank pass."""
+    options = valid_choices(choices)
     option_hits: dict[int, list[Hit]] = {}
     assessments: list[dict[str, Any]] = []
     comparison_direction = _comparison_direction(question)
     _, comparison_column = extract_dimension_labels(question)
+    table_language = any(term in normalize_text(question) for term in ("Excel", "xlsx", "xls", "表中", "统计表", "报表", "单元格"))
+    search_qa_type = "table_lookup" if (requires_table is True or (requires_table is None and table_language)) else qa_type
     # Rerank the stem once. Option-specific calls below still use independent
     # lexical/vector retrieval, but skip their duplicate CrossEncoder passes.
     # This preserves evidence separation while removing the largest CPU cost.
-    shared_hits = _agent_search(index, question, qa_type, max(4, min(top_k, 12)), filters, rerank=True, dense=True)
-    for option_index, option in enumerate(choices[:4]):
-        label = "ABCD"[option_index]
+    shared_hits = _agent_search(index, question, search_qa_type, max(4, min(top_k, 12)), filters, rerank=True, dense=True)
+    for option_index, option in enumerate(options):
+        label = choice_label(option_index)
         # The stem and the option are deliberately searched separately.  A
         # single query containing all options lets common words dominate and
         # was the source of the unrelated answer shown in the screenshot.
@@ -505,7 +552,7 @@ def run_choice_agent(
         else:
             option_query = f"{question} 选项{label} {option}"
         option_top_k = max(12, min(top_k * 4, 32))
-        option_specific_hits = _agent_search(index, option_query, qa_type, option_top_k, filters, rerank=False, dense=False)
+        option_specific_hits = _agent_search(index, option_query, search_qa_type, option_top_k, filters, rerank=False, dense=False)
         hits = _merge_option_hits(option_specific_hits, shared_hits)
         option_hits[option_index] = hits
         overall, minimum, evidence_ids = _option_support(option, hits)
@@ -520,7 +567,7 @@ def run_choice_agent(
 
     selected_index: int | None = None
     human_in_loop: dict[str, Any] | None = None
-    comparison = _table_comparison_result(question, choices, option_hits)
+    comparison = _table_comparison_result(question, options, option_hits)
     if comparison is not None:
         selected_index = int(comparison["selected_index"])
         for index, assessment in enumerate(assessments):
@@ -570,4 +617,5 @@ def run_choice_agent(
         }
     if human_in_loop is not None:
         human_in_loop["options"] = assessments
-    return ChoiceAgentResult("multiple_choice", question, choices[:4], option_hits, assessments, selected_index, human_in_loop)
+    semantic_intent = intent or infer_intent(question, qa_type, options)
+    return ChoiceAgentResult(semantic_intent, question, options, option_hits, assessments, selected_index, human_in_loop)

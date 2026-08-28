@@ -9,12 +9,13 @@ from typing import Any, Callable
 from .agent import build_agent_workflow, identify_intent, organize_evidence, run_choice_agent
 from .config import Settings
 from .generation import GroundedGenerator, split_grounded_claims
-from .query import classify_question_scope, extract_inline_choices, parse_query
+from .query import classify_question_scope, enrich_parsed_query, extract_inline_choices, parse_query, valid_choices
 from .reasoning import AnswerDraft, reason
 from .retrieval.index import HybridIndex
 from .retrieval.bge import BGEConfig, BGEPipeline
 from .schemas import QAResponse
 from .storage import Store
+from .utils import normalize_text
 from .verification import trust_decision, verify_claims
 
 
@@ -61,7 +62,7 @@ class TrustRAGService:
 
         report("understanding", label="正在理解问题与识别查询类型")
         question_for_retrieval, inline_choices = extract_inline_choices(question)
-        effective_choices = [str(value).strip() for value in (choices or inline_choices) if str(value).strip()]
+        effective_choices = valid_choices(choices or inline_choices)
         # Full, self-contained questions must remain isolated from earlier
         # turns.  Mixing them with history can duplicate years/file hints and
         # make the metadata gate or missing-year guard reject a valid repeat.
@@ -77,6 +78,7 @@ class TrustRAGService:
         parsed.original_query = question
         if qa_type:
             parsed.qa_type = qa_type  # type: ignore[assignment]
+        enrich_parsed_query(parsed, question_for_analysis, effective_choices)
         # A multiple-choice stem may be generic while the regulatory domain
         # anchor appears only inside an option (for example, “商业银行不得…”).
         scope = classify_question_scope(" ".join([question_for_analysis, *effective_choices]))
@@ -127,44 +129,61 @@ class TrustRAGService:
         retrieval_query += " " + " ".join(str(anchor) for anchor in retrieval_anchors if anchor)
         # Options are intentionally not concatenated into this base query.  The
         # choice agent below retrieves each option independently.
-        retrieval_k = max(self.settings.top_k, 32) if parsed.requires_table else self.settings.top_k
+        requirements = parsed.requirements
+        retrieval_qa_type = "table_lookup" if requirements["table"] else parsed.qa_type
+        retrieval_k = max(self.settings.top_k, 32) if requirements["table"] else self.settings.top_k
         report("retrieving", label="正在检索本地制度与统计资料", routes=["bm25", "metadata", "bge_vector"])
-        if parsed.qa_type == "cross_file_judgment":
-            # Cross-file questions have two independent scopes.  The named
-            # workbook constrains the structured/statistical hop, but must not
-            # constrain the regulatory-definition hop.
-            table_hits = self.index.hybrid_search(retrieval_query, "table_lookup", retrieval_k, filters)
-            rule_filters = {
-                key: value
-                for key, value in filters.items()
-                if key not in {"title", "file_name"}
-            }
-            rule_query = " ".join(
-                str(value)
-                for value in [
-                    parsed.entities.get("indicator"),
-                    "监管制度 监管要求 监管阈值 计算公式 指标解释",
-                    parsed.entities.get("period"),
-                ]
-                if value
+        if requirements["multi_file"]:
+            # Multi-file retrieval is a general capability.  Search each named
+            # source independently before merging so one high-scoring document
+            # cannot erase evidence from the other requested files.
+            hits = _multi_file_search(
+                self.index,
+                retrieval_query,
+                retrieval_qa_type,
+                retrieval_k,
+                filters,
+                parsed.entities,
             )
-            rule_hits = self.index.hybrid_search(rule_query, "cross_file_judgment", max(retrieval_k, 16), rule_filters)
-            # Formula definitions may be represented as structured Excel
-            # cells rather than text paragraphs (for example, 2025 schedule
-            # sheet ``指标解释!C6``).  Add a high-recall, exact-term table hop
-            # so the definition is not lost to the cross-file reranker.
-            year_match = re.search(r"20\d{2}", str(parsed.entities.get("period") or question))
-            formula_hits = self.index.search_formula_evidence(
-                str(parsed.entities.get("indicator") or ""),
-                max(retrieval_k, 8),
-                rule_filters,
-                year_match.group(0) if year_match else None,
+
+            # Rule + data joins are one composition of multi-file capability,
+            # not a dedicated workflow type.  Relax workbook filters only for
+            # the rule hop and retain source metadata on every resulting hit.
+            needs_rule_data_join = (
+                requirements["table"]
+                and requirements["comparison"]
+                and parsed.intent in {"judge", "verify"}
             )
-            hits = _merge_hits(rule_hits, formula_hits, table_hits)
+            if needs_rule_data_join:
+                rule_filters = {
+                    key: value
+                    for key, value in filters.items()
+                    if key not in {"title", "file_name"}
+                }
+                rule_query = " ".join(
+                    str(value)
+                    for value in [
+                        parsed.entities.get("indicator"),
+                        "监管制度 监管要求 监管阈值 计算公式 指标解释",
+                        parsed.entities.get("period"),
+                    ]
+                    if value
+                )
+                rule_hits = self.index.hybrid_search(rule_query, parsed.qa_type, max(retrieval_k, 16), rule_filters)
+                formula_hits: list[Any] = []
+                if hasattr(self.index, "search_formula_evidence"):
+                    year_match = re.search(r"20\d{2}", str(parsed.entities.get("period") or question))
+                    formula_hits = self.index.search_formula_evidence(
+                        str(parsed.entities.get("indicator") or ""),
+                        max(retrieval_k, 8),
+                        rule_filters,
+                        year_match.group(0) if year_match else None,
+                    )
+                hits = _merge_hits(rule_hits, formula_hits, hits)
         else:
-            hits = self.index.hybrid_search(retrieval_query, parsed.qa_type, retrieval_k, filters)
+            hits = self.index.hybrid_search(retrieval_query, retrieval_qa_type, retrieval_k, filters)
         choice_result = None
-        if len(effective_choices) >= 2:
+        if requirements["option_evaluation"]:
             report("choice_retrieval", label="正在分别核对每个选项的证据")
             choice_result = run_choice_agent(
                 self.index,
@@ -173,6 +192,8 @@ class TrustRAGService:
                 parsed.qa_type,
                 filters,
                 max(self.settings.top_k, 8),
+                intent=parsed.intent,
+                requires_table=requirements["table"],
             )
             hits = _merge_hits(hits, choice_result.all_hits)
         _enrich_hits(self.index, hits)
@@ -194,13 +215,25 @@ class TrustRAGService:
             if choice_result is not None:
                 draft = _choice_answer_draft(choice_result)
             else:
-                draft = reason(question_for_retrieval, parsed.qa_type, None, hits)
+                draft = reason(
+                    question_for_retrieval,
+                    parsed.qa_type,
+                    None,
+                    hits,
+                    intent=parsed.intent,
+                    requirements=requirements,
+                )
         llm_generation = self.generator.status() if hasattr(self, "generator") else {"provider": "none", "enabled": False, "status": "disabled"}
         if choice_result is None and hits and not _has_terminal_operation(draft.operations) and not _has_deterministic_operation(draft.operations):
             generator = getattr(self, "generator", None)
             if generator is not None and generator.enabled:
                 report("generating", label="正在基于已检索证据生成回答")
-                context_hits = _minimal_display_hits(hits, draft.operations, None)
+                context_hits = _minimal_display_hits(
+                    hits,
+                    draft.operations,
+                    None,
+                    preserve_sources=requirements["multi_file"],
+                )
                 generated = generator.generate(question_for_retrieval, parsed, context_hits, draft.operations)
                 llm_generation = {
                     **generator.status(),
@@ -238,7 +271,22 @@ class TrustRAGService:
         retry_record: dict[str, Any] | None = None
         if _should_retry_verification(verification, draft, choice_result, missing_year):
             retry_query = _verification_retry_query(parsed, question_for_retrieval)
-            retry_hits = self.index.hybrid_search(retry_query, parsed.qa_type, max(retrieval_k, self.settings.top_k * 2), filters)
+            if requirements["multi_file"]:
+                retry_hits = _multi_file_search(
+                    self.index,
+                    retry_query,
+                    retrieval_qa_type,
+                    max(retrieval_k, self.settings.top_k * 2),
+                    filters,
+                    parsed.entities,
+                )
+            else:
+                retry_hits = self.index.hybrid_search(
+                    retry_query,
+                    retrieval_qa_type,
+                    max(retrieval_k, self.settings.top_k * 2),
+                    filters,
+                )
             hits = _merge_hits(hits, retry_hits)
             if choice_result is not None:
                 # A selection question must retain option-wise retrieval after
@@ -252,6 +300,8 @@ class TrustRAGService:
                     parsed.qa_type,
                     filters,
                     max(self.settings.top_k * 2, 12),
+                    intent=parsed.intent,
+                    requires_table=requirements["table"],
                 )
                 hits = _merge_hits(hits, choice_result.all_hits)
             _enrich_hits(self.index, hits)
@@ -263,7 +313,14 @@ class TrustRAGService:
                     [{"type": "refusal", "source": None, "reason": f"知识库缺少{retry_missing_year}年证据"}],
                 )
             else:
-                draft = _choice_answer_draft(choice_result) if choice_result is not None else reason(question_for_retrieval, parsed.qa_type, None, hits)
+                draft = _choice_answer_draft(choice_result) if choice_result is not None else reason(
+                    question_for_retrieval,
+                    parsed.qa_type,
+                    None,
+                    hits,
+                    intent=parsed.intent,
+                    requirements=requirements,
+                )
             verification = verify_claims(draft.answer, question, hits, draft.claims, draft.operations)
             retry_record = {
                 "type": "verification_retry",
@@ -295,7 +352,12 @@ class TrustRAGService:
             trust["score"] = min(trust["score"], 0.35)
             trust["components"]["evidence"] = 0.0
             trust.setdefault("reasons", []).append("自动检索无法唯一确定选项，已转人工确认")
-        display_hits = _minimal_display_hits(hits, draft.operations, clarification or refusal or human_in_loop)
+        display_hits = _minimal_display_hits(
+            hits,
+            draft.operations,
+            clarification or refusal or human_in_loop,
+            preserve_sources=requirements["multi_file"],
+        )
         if trust["decision"] != "answer":
             if refusal is not None:
                 pass
@@ -317,15 +379,21 @@ class TrustRAGService:
             retrieval_routes.append("char_ngram_fallback")
         if parsed.requires_table:
             retrieval_routes.append("structured_table")
+        if requirements["multi_file"]:
+            retrieval_routes.append("multi_file")
         if choice_result is not None:
             retrieval_routes.append("choice_agent")
         plan = {
             "original_query": parsed.original_query,
             "qa_type": parsed.qa_type,
+            "intent": parsed.intent,
+            "answer_format": parsed.answer_format,
+            "requirements": requirements,
             "entities": parsed.entities,
             "requires_table": parsed.requires_table,
             "requires_multi_hop": parsed.requires_multi_hop,
             "retrieval_routes": retrieval_routes,
+            "retrieval_qa_type": retrieval_qa_type,
             "model_status": self.index.model_status if hasattr(self.index, "model_status") else {"mode": "unknown"},
             "generation": llm_generation,
             "retrieved_evidence_ids": [hit.evidence_id for hit in hits],
@@ -335,7 +403,7 @@ class TrustRAGService:
             "minimal_evidence_ids": [hit.evidence_id for hit in display_hits],
             "operations": draft.operations,
             "scope": scope,
-            "agent": identify_intent(question_for_retrieval, effective_choices, parsed.qa_type),
+            "agent": identify_intent(question_for_retrieval, effective_choices, parsed.qa_type, parsed),
         }
         if choice_result is not None:
             plan["agent"] = choice_result.to_plan()
@@ -375,6 +443,9 @@ class TrustRAGService:
         plan = {
             "original_query": parsed.original_query,
             "qa_type": parsed.qa_type,
+            "intent": parsed.intent,
+            "answer_format": parsed.answer_format,
+            "requirements": parsed.requirements,
             "entities": parsed.entities,
             "requires_table": False,
             "requires_multi_hop": False,
@@ -384,7 +455,7 @@ class TrustRAGService:
             "minimal_evidence_ids": [],
             "operations": draft.operations,
             "scope": scope,
-            "agent": identify_intent(question_for_retrieval, choices, parsed.qa_type),
+            "agent": identify_intent(question_for_retrieval, choices, parsed.qa_type, parsed),
         }
         workflow = build_agent_workflow(parsed, question_for_retrieval, choices)
         for task in workflow["tasks"]:
@@ -406,36 +477,69 @@ def _choice_answer_draft(choice_result: Any) -> AnswerDraft:
         if comparison:
             direction_text = "最高" if comparison.get("direction") == "max" else "最低"
             selected_text = choice_result.choices[selected_index]
-            answer = f"选项 {label}：{selected_text}（在“{comparison.get('column')}”口径下数值{direction_text}）。"
+            compared_values = comparison.get("compared_values") or []
+            value_parts = [
+                f"{item.get('label')}={_display_comparison_value(item, choice_result)}"
+                for item in compared_values
+            ]
+            comparison_text = "，".join(value_parts)
+            answer = (
+                f"明确答案：选项 {label}（{_clip_answer_text(selected_text, 48)}）。"
+                f"关键比较：在“{comparison.get('column')}”口径下，{comparison_text}。"
+                f"{label} 的数值{direction_text}。最终结论：选择 {label}。"
+            )
             return AnswerDraft(
                 answer,
                 [],
                 [{
                     "type": "choice_agent",
-                    "intent": "table_comparison",
+                    "intent": choice_result.intent,
+                    "answer_format": choice_result.answer_format,
+                    "method": "deterministic_table_comparison",
                     "selected_option": label,
                     "selected_text": selected_text,
                     "confidence": selected["score"],
                     "comparison": comparison,
+                    "comparison_summary": [
+                        {
+                            "label": item.get("label"),
+                            "value": _display_comparison_value(item, choice_result),
+                            "evidence_id": item.get("evidence_id"),
+                        }
+                        for item in compared_values
+                    ],
                     "option_assessments": assessments,
                     "display_evidence_ids": selected.get("evidence_ids", []),
                 }],
             )
-        # The original option may strengthen a normative phrase relative to a
-        # split clause (for example, an enumerated qualifying condition). The
-        # answer therefore returns the verified option label and exposes the
-        # exact option/evidence through the structured audit record instead of
-        # restating a potentially stronger paraphrase as a generated claim.
-        answer = f"选项 {label}：该选项已获得证据链支持。"
+        explanations = _choice_evidence_explanations(choice_result, selected.get("evidence_ids", []))
+        answer = _render_grounded_choice_answer(
+            label,
+            choice_result.choices[selected_index],
+            explanations,
+        )
+        # Keep ordinary choice answers near the 80-200 Chinese-character
+        # target. One core item is still a sufficient explanation when two
+        # source excerpts would make the response unnecessarily long.
+        if len(answer) > 220 and len(explanations) > 1:
+            explanations = explanations[:1]
+            answer = _render_grounded_choice_answer(
+                label,
+                choice_result.choices[selected_index],
+                explanations,
+            )
         return AnswerDraft(
             answer,
-            [],
+            [item["excerpt"] for item in explanations],
             [{
                 "type": "choice_agent",
-                "intent": "multiple_choice",
+                "intent": choice_result.intent,
+                "answer_format": choice_result.answer_format,
+                "method": "independent_option_evidence",
                 "selected_option": label,
                 "confidence": selected["score"],
                 "option_assessments": assessments,
+                "evidence_explanations": explanations,
                 "display_evidence_ids": selected.get("evidence_ids", []),
             }],
         )
@@ -447,7 +551,91 @@ def _choice_answer_draft(choice_result: Any) -> AnswerDraft:
     ))
     hitl["display_evidence_ids"] = all_evidence_ids
     answer = "当前没有足够的证据唯一确定正确选项，系统已进入人工确认环节。请核对右侧各选项证据后补充或确认答案。"
-    return AnswerDraft(answer, [], [{"type": "human_in_loop", **hitl}])
+    return AnswerDraft(answer, [], [{
+        "type": "human_in_loop",
+        "intent": choice_result.intent,
+        "answer_format": choice_result.answer_format,
+        **hitl,
+    }])
+
+
+def _choice_evidence_explanations(
+    choice_result: Any,
+    evidence_ids: list[str],
+    limit: int = 2,
+) -> list[dict[str, str]]:
+    by_id = {hit.evidence_id: hit for hit in choice_result.all_hits}
+    explanations: list[dict[str, str]] = []
+    for evidence_id in dict.fromkeys(str(value) for value in evidence_ids if value):
+        hit = by_id.get(evidence_id)
+        if hit is None:
+            continue
+        item = hit.item
+        content = normalize_text(
+            item.get("content")
+            or item.get("context_window")
+            or item.get("context")
+            or " | ".join(
+                str(item.get(key) or "")
+                for key in ("indicator", "period", "row_header", "column_header", "value_text", "unit")
+                if item.get(key) not in (None, "")
+            )
+            or ""
+        )
+        if not content:
+            continue
+        explanations.append({
+            "evidence_id": evidence_id,
+            "source": normalize_text(
+                item.get("source_title")
+                or item.get("source_file_name")
+                or item.get("table_name")
+                or "相关材料"
+            )[:32],
+            "excerpt": _clip_answer_text(content, 64),
+        })
+        if len(explanations) >= limit:
+            break
+    return explanations
+
+
+def _render_grounded_choice_answer(
+    label: str,
+    selected_text: str,
+    explanations: list[dict[str, str]],
+) -> str:
+    evidence_text = "；".join(
+        f"《{item['source']}》记载“{item['excerpt']}”"
+        for item in explanations
+    )
+    return (
+        f"明确答案：选项 {label}（{_clip_answer_text(selected_text, 48)}）。"
+        f"核心证据：{evidence_text}。"
+        f"上述证据与选项 {label} 的关键陈述一致。最终结论：选择 {label}。"
+    )
+
+
+def _display_comparison_value(value: dict[str, Any], choice_result: Any) -> str:
+    evidence_id = str(value.get("evidence_id") or "")
+    hit = next((item for item in choice_result.all_hits if item.evidence_id == evidence_id), None)
+    raw_value = hit.item.get("value_text") if hit is not None else value.get("value")
+    if isinstance(raw_value, float):
+        displayed = f"{raw_value:.10f}".rstrip("0").rstrip(".")
+    else:
+        displayed = normalize_text(raw_value).strip('"')
+    unit = normalize_text(hit.item.get("unit")) if hit is not None and not hit.item.get("unit_inferred") else ""
+    return f"{displayed}{unit}" if unit and not displayed.endswith(unit) else displayed
+
+
+def _clip_answer_text(value: Any, limit: int) -> str:
+    text = normalize_text(value).strip("。；; ")
+    if len(text) <= limit:
+        return text
+    clipped = text[:limit]
+    boundary = max(clipped.rfind(mark) for mark in "，；。")
+    if boundary >= max(16, limit // 2):
+        clipped = clipped[:boundary]
+    return clipped.rstrip("，；。 ") + "…"
 
 
 def _draft_confidence(draft: Any) -> float:
@@ -462,7 +650,10 @@ def _has_terminal_operation(operations: list[dict[str, Any]]) -> bool:
 
 
 def _has_deterministic_operation(operations: list[dict[str, Any]]) -> bool:
-    return any(operation.get("type") == "table_calculation" for operation in operations)
+    return any(
+        operation.get("type") in {"table_calculation", "cross_file_judgment", "choice_agent"}
+        for operation in operations
+    )
 
 
 def _requested_year_missing(years: list[str], hits: list[Any]) -> str | None:
@@ -587,7 +778,7 @@ def _finalize_agent_workflow(
         "items": organize_evidence(hits, minimal_evidence_ids, draft.operations),
     }
     workflow["answer_generation"] = {
-        "strategy": "llm_grounded_with_deterministic_fallback" if any(operation.get("type") == "llm_generation" and operation.get("status") == "accepted" for operation in draft.operations) else "grounded_deterministic_template",
+        "strategy": _answer_generation_strategy(draft.operations),
         "claims": verification.claim_results,
         "llm": next((operation for operation in draft.operations if operation.get("type") == "llm_generation"), None),
     }
@@ -604,7 +795,13 @@ def _finalize_agent_workflow(
     }
 
 
-def _minimal_display_hits(hits: list[Any], operations: list[dict[str, Any]], control_operation: dict[str, Any] | None) -> list[Any]:
+def _minimal_display_hits(
+    hits: list[Any],
+    operations: list[dict[str, Any]],
+    control_operation: dict[str, Any] | None,
+    *,
+    preserve_sources: bool = False,
+) -> list[Any]:
     """Return only the evidence needed to explain the displayed answer."""
     explicit_ids = []
     for operation in operations:
@@ -621,7 +818,87 @@ def _minimal_display_hits(hits: list[Any], operations: list[dict[str, Any]], con
         exact = [hit for hit in hits if hit.item.get("cell_address") == lookup["cell"]]
         if exact:
             return exact[:1]
+    if preserve_sources:
+        # Give Generation and Verification at least one item from every
+        # retrieved document before filling the normal compact evidence set.
+        # This prevents a high-scoring file from erasing the other side of a
+        # comparison or rule+data join.
+        selected: list[Any] = []
+        seen_sources: set[str] = set()
+        for hit in hits:
+            source = str(
+                hit.item.get("doc_id")
+                or hit.item.get("source_file_name")
+                or hit.item.get("source_title")
+                or hit.evidence_id
+            )
+            if source not in seen_sources:
+                selected.append(hit)
+                seen_sources.add(source)
+        selected_ids = {hit.evidence_id for hit in selected}
+        for hit in hits:
+            if len(selected) >= max(4, len(seen_sources)):
+                break
+            if hit.evidence_id not in selected_ids:
+                selected.append(hit)
+                selected_ids.add(hit.evidence_id)
+        return selected
     return hits[:4]
+
+
+def _multi_file_search(
+    index: Any,
+    query: str,
+    qa_type: str,
+    top_k: int,
+    filters: dict[str, Any] | None,
+    entities: dict[str, Any],
+) -> list[Any]:
+    """Search named sources separately, then merge without losing provenance."""
+    base_filters = dict(filters or {})
+    groups: list[list[Any]] = [index.hybrid_search(query, qa_type, top_k, base_filters)]
+    scopes: list[tuple[str, str]] = []
+
+    def add_scope(key: str, value: Any) -> None:
+        normalized = str(value or "").strip()
+        scope = (key, normalized)
+        if normalized and scope not in scopes:
+            scopes.append(scope)
+
+    for value in entities.get("filenames") or []:
+        add_scope("file_name", value)
+    for value in entities.get("title_hints") or []:
+        add_scope("title", value)
+    for key in ("file_name", "title"):
+        values = base_filters.get(key) or []
+        if not isinstance(values, list):
+            values = [values]
+        for value in values:
+            add_scope(key, value)
+
+    common_filters = {
+        key: value for key, value in base_filters.items()
+        if key not in {"file_name", "title"}
+    }
+    for key, value in scopes:
+        scoped_filters = {**common_filters, key: [value]}
+        groups.append(index.hybrid_search(query, qa_type, max(top_k, 8), scoped_filters))
+    return _merge_hits(*groups)
+
+
+def _answer_generation_strategy(operations: list[dict[str, Any]]) -> str:
+    if any(operation.get("type") == "llm_generation" and operation.get("status") == "accepted" for operation in operations):
+        return "llm_grounded_with_deterministic_fallback"
+    choice = next((operation for operation in operations if operation.get("type") == "choice_agent"), None)
+    if choice is not None:
+        return (
+            "deterministic_table_comparison_explanation"
+            if choice.get("method") == "deterministic_table_comparison"
+            else "evidence_grounded_choice_explanation"
+        )
+    if any(operation.get("type") == "cross_file_judgment" for operation in operations):
+        return "deterministic_cross_file_explanation"
+    return "grounded_deterministic_template"
 
 
 def _merge_hits(*groups: list[Any]) -> list[Any]:

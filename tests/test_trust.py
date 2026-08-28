@@ -155,9 +155,15 @@ def test_cross_file_judgment_compares_value_only_when_threshold_is_evidenced():
     draft = cross_file_answer("根据监管制度和2025年商业银行主要监管指标情况表，判断当前不良贷款率是否满足监管要求。", hits)
 
     assert draft.operations[0]["type"] == "cross_file_judgment"
+    assert "规则文件A（商业银行风险监管核心指标）提供规则" in draft.answer
+    assert "数据文件B（2025年商业银行主要监管指标情况表）提供数据" in draft.answer
+    assert "比较过程：实际值1.496%≤5%" in draft.answer
+    assert "最终结论：满足监管要求" in draft.answer
     assert "满足监管要求" in draft.answer
     assert "1.496%" in draft.answer
     assert "5%" in draft.answer
+    assert draft.operations[0]["rule_source"] == "商业银行风险监管核心指标"
+    assert draft.operations[0]["data_source"] == "2025年商业银行主要监管指标情况表"
 
 
 def test_absolute_future_risk_question_does_not_return_unrelated_fragment():

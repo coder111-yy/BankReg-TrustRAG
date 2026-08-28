@@ -97,7 +97,12 @@ class GroundedGenerator:
             "必须保持证据中的‘应当、可以、不得、原则上’等规范强度。"
             "统计值、比较关系和计算结果必须以 DETERMINISTIC_FACTS 为准，不要自行改算。"
             "如果证据不足以回答，明确说明无法可靠回答。"
-            "只输出简洁、直接的用户答案：不要复述完整问题或文件名，不要输出检索过程、信任分、耗时、"
+            "最小证据是最小充分证据，不等于最短回答；普通回答通常控制在80至200个中文字，复杂跨文件问题可以更长。"
+            "选择题应依次给出明确答案、1至2句核心证据解释和最终结论；只有 EVIDENCE_CONTEXT 中存在明确反证时，"
+            "才可简要说明其他选项错误原因，严禁自行编造反选项理由。"
+            "表格比较题必须列出各选项的关键比较值，并以 DETERMINISTIC_FACTS 中的比较结果为准。"
+            "跨文件判断题必须分别说明规则文件提供的规则、数据文件提供的数据、比较过程与最终结论。"
+            "只输出清晰、直接的用户答案：不要复述完整问题，不要输出检索过程、信任分、耗时、"
             "文件路径、Evidence ID 或 [证据: ...] 标记。证据会在界面的证据链区域单独展示。"
             "统计表多期间查询时按期间分行列出结果；除非问题要求，否则不要添加背景说明。"
         )
@@ -105,6 +110,9 @@ class GroundedGenerator:
             [
                 f"USER_QUESTION: {normalize_text(question)}",
                 f"QUESTION_TYPE: {parsed.qa_type}",
+                f"INTENT: {parsed.intent}",
+                f"ANSWER_FORMAT: {parsed.answer_format}",
+                f"REQUIREMENTS: {json.dumps(parsed.requirements, ensure_ascii=False, default=str)}",
                 f"QUERY_ENTITIES: {json.dumps(parsed.entities, ensure_ascii=False, default=str)}",
                 f"DETERMINISTIC_FACTS: {json.dumps(_safe_operations(operations), ensure_ascii=False, default=str)}",
                 "EVIDENCE_CONTEXT:",
@@ -239,20 +247,32 @@ def _evidence_content(item: dict[str, Any], kind: str) -> str:
 def _safe_operations(operations: list[dict[str, Any]]) -> list[dict[str, Any]]:
     allowed = {
         "type", "value", "values", "unit", "period", "formula", "threshold",
-        "comparator", "confidence",
+        "comparator", "confidence", "intent", "answer_format", "method",
+        "selected_option", "selected_text", "comparison_summary", "data_source",
+        "rule_source",
     }
     safe_operations: list[dict[str, Any]] = []
     for operation in operations:
-        safe = {key: value for key, value in operation.items() if key in allowed}
-        values = safe.get("values")
-        if isinstance(values, list):
-            safe["values"] = [
-                {key: value for key, value in item.items() if key not in {"evidence_id", "cell"}}
-                if isinstance(item, dict) else item
-                for item in values
-            ]
+        safe = {
+            key: _safe_operation_value(value)
+            for key, value in operation.items()
+            if key in allowed
+        }
         safe_operations.append(safe)
     return safe_operations
+
+
+def _safe_operation_value(value: Any) -> Any:
+    """Remove internal evidence identifiers from facts sent to the LLM."""
+    if isinstance(value, list):
+        return [_safe_operation_value(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _safe_operation_value(item)
+            for key, item in value.items()
+            if key not in {"evidence_id", "evidence_ids", "cell", "cell_address"}
+        }
+    return value
 
 
 def split_grounded_claims(answer: str) -> list[str]:
