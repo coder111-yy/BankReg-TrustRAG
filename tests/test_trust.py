@@ -14,6 +14,23 @@ def test_unverified_number_is_not_answered():
     assert decision["decision"] in {"clarify", "refuse"}
 
 
+def test_percentage_from_calculation_trace_is_verified():
+    hit = Hit("table", {"evidence_id": "e1", "value_text": "47945.35", "unit": "亿元"})
+    answer = "同比增长率为12.74%。"
+    operation = {
+        "type": "calculation",
+        "operation": "growth_rate",
+        "result": "12.74",
+        "unit": "%",
+        "evidence_ids": ["e1"],
+    }
+
+    verification = verify_claims(answer, "同比增长率是多少", [hit], [answer], [operation])
+
+    assert verification.numeric_ok is True
+    assert verification.unit_ok is True
+
+
 def test_verification_links_each_claim_to_supporting_evidence():
     hit = Hit("text", {"evidence_id": "text:d1:p1", "content": "商业银行不得挪用客户资金。"})
 
@@ -24,8 +41,152 @@ def test_verification_links_each_claim_to_supporting_evidence():
         "claim_id": "claim_1",
         "text": "商业银行不得挪用客户资金。",
         "evidence_ids": ["text:d1:p1"],
+        "calculation_ids": [],
         "supported": True,
     }]
+
+
+def test_verification_accepts_calculated_spread_and_links_calculation_trace():
+    hits = [
+        Hit("table", {"evidence_id": "e_life", "value_text": "35378.91", "unit": "亿元", "context": "人身险原保险保费收入 35378.91"}),
+        Hit("table", {"evidence_id": "e_property", "value_text": "15867.79", "unit": "亿元", "context": "财产险原保险保费收入 15867.79"}),
+        Hit("table", {"evidence_id": "e_industry", "value_text": "51246.71", "unit": "亿元", "context": "保险业原保险保费收入 51246.71"}),
+    ]
+    operations = [
+        {
+            "type": "calculation", "id": "calc1", "operation": "sum",
+            "input_refs": ["r1", "r2"], "result": "51246.7", "unit": "亿元",
+            "trace": "35378.91 + 15867.79 = 51246.7",
+            "evidence_ids": ["e_life", "e_property"], "details": {},
+        },
+        {
+            "type": "calculation", "id": "calc2", "operation": "verify_consistency",
+            "input_refs": ["calc1", "r3"], "result": "false", "unit": None,
+            "trace": "spread 0.01 <= tolerance 0 = false",
+            "evidence_ids": ["e_life", "e_property", "e_industry"],
+            "details": {"spread": "0.01", "tolerance": "0"},
+        },
+    ]
+    answer = (
+        "人身险与财产险原保险保费收入之和为51246.70亿元，"
+        "保险业原保险保费收入为51246.71亿元；两者相差0.01亿元，不一致。"
+    )
+    claims = [
+        "人身险与财产险原保险保费收入之和为51246.70亿元，保险业原保险保费收入为51246.71亿元",
+        "两者相差0.01亿元，不一致",
+    ]
+
+    verification = verify_claims(answer, "两者是否一致", hits, claims, operations)
+
+    assert verification.passed
+    assert verification.numeric_ok is True
+    assert verification.failure_details == []
+    assert verification.claim_results[1]["calculation_ids"] == ["calc2"]
+    assert verification.claim_results[1]["evidence_ids"] == ["e_life", "e_property", "e_industry"]
+
+
+def test_verification_does_not_decide_consistency_language():
+    hit = Hit("table", {"evidence_id": "e1", "value_text": "51246.71", "unit": "亿元"})
+    operation = {
+        "type": "calculation", "id": "calc2", "operation": "verify_consistency",
+        "input_refs": ["calc1", "r3"], "result": "false", "unit": None,
+        "trace": "spread 0.01 <= tolerance 0 = false", "evidence_ids": ["e1"],
+        "details": {"spread": "0.01", "tolerance": "0"},
+    }
+    basic = "两者存在0.01亿元差异，数值基本一致。"
+    exact = "两者相差0.01亿元，但完全一致。"
+
+    basic_verification = verify_claims(basic, "是否一致", [hit], [basic], [operation])
+    exact_verification = verify_claims(exact, "是否一致", [hit], [exact], [operation])
+
+    assert basic_verification.passed
+    assert exact_verification.passed
+    assert not any(
+        item["error_type"] == "consistency_mismatch"
+        for item in [*basic_verification.failure_details, *exact_verification.failure_details]
+    )
+
+
+def test_qualitative_business_conclusion_uses_declared_calculation_refs():
+    hit = Hit("table", {"evidence_id": "e1", "value_text": "51246.71", "unit": "亿元"})
+    operation = {
+        "type": "calculation", "id": "calc2", "operation": "compare",
+        "input_refs": ["calc1", "r3"], "result": "false", "unit": None,
+        "trace": "51246.7 == 51246.71 = false", "evidence_ids": ["e1"],
+        "details": {"operator": "=="},
+    }
+    claim = "两者数值不同，因此整体上不一致。"
+
+    verification = verify_claims(
+        claim,
+        "两者是否一致",
+        [hit],
+        [claim],
+        [operation],
+        grounding_refs={"ar1": ["calc2"]},
+    )
+
+    assert verification.passed
+    assert verification.claim_results[0]["calculation_ids"] == ["calc2"]
+    assert verification.claim_results[0]["evidence_ids"] == ["e1"]
+
+
+def test_verification_failure_details_include_numeric_provenance():
+    hit = Hit("table", {"evidence_id": "e1", "value_text": "10", "unit": "亿元"})
+
+    verification = verify_claims("结果为11亿元。", "结果是多少", [hit], ["结果为11亿元。"], [])
+
+    assert not verification.numeric_ok
+    failure = next(item for item in verification.failure_details if item["error_type"] == "unsupported_number")
+    assert failure["claim"] == "结果为11亿元。"
+    assert failure["actual"] == "11"
+    assert failure["evidence_ids"] == ["e1"]
+    assert failure["calculation_ids"] == []
+
+
+def test_verification_reports_answer_completeness_without_judging_style():
+    hit = Hit("table", {"evidence_id": "e1", "value_text": "10", "unit": "亿元", "context": "总资产10亿元"})
+    completeness = SimpleNamespace(complete=False, missing_requirement_ids=("ar2",))
+
+    verification = verify_claims(
+        "总资产为10亿元。",
+        "总资产是多少，与去年相差多少？",
+        [hit],
+        ["总资产为10亿元。"],
+        [],
+        completeness=completeness,
+    )
+
+    assert verification.completeness_ok is False
+    assert any(
+        item["error_type"] == "incomplete_answer"
+        and item["actual"] == {"missing_requirement_ids": ["ar2"]}
+        for item in verification.failure_details
+    )
+
+
+def test_verification_does_not_derive_unrecorded_spread_from_compare_inputs():
+    hit = Hit("table", {"evidence_id": "e1", "value_text": "51246.71", "unit": "亿元"})
+    operation = {
+        "type": "calculation", "id": "calc2", "operation": "compare",
+        "input_refs": ["calc1", "r3"],
+        "inputs": [
+            {"ref": "calc1", "value": "51246.70", "unit": "亿元", "evidence_ids": ["e1"]},
+            {"ref": "r3", "value": "51246.71", "unit": "亿元", "evidence_ids": ["e1"]},
+        ],
+        "result": "false", "unit": None,
+        "trace": "51246.70 == 51246.71 = false", "evidence_ids": ["e1"],
+        "details": {"operator": "=="},
+    }
+    answer = "两者相差0.01亿元，数值基本一致，但并非完全相等。"
+
+    verification = verify_claims(answer, "是否一致", [hit], [answer], [operation])
+
+    assert not verification.passed
+    assert any(
+        item["error_type"] == "unsupported_number" and item["actual"] == "0.01"
+        for item in verification.failure_details
+    )
 
 
 def test_verification_uses_bounded_clause_context_window():

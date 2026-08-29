@@ -3,7 +3,8 @@ from pathlib import Path
 import pytest
 
 from bankreg_trustrag.ingestion.manifest import build_document_relations
-from bankreg_trustrag.ingestion.parsers import _header_row_count, parse_file
+from bankreg_trustrag.ingestion.parsers import _cell_records, _header_row_count, parse_file
+from bankreg_trustrag.schemas import Document
 
 
 def test_excel_header_window_stops_before_first_numeric_data_row():
@@ -15,6 +16,28 @@ def test_excel_header_window_stops_before_first_numeric_data_row():
     ]
 
     assert _header_row_count(rows) == 3
+
+
+def test_excel_sheet_unit_in_merged_header_applies_to_all_numeric_columns():
+    rows = [
+        [None, "2023年10月全国各地区原保险保费收入情况表", None, None, None],
+        [None, None, None, None, "单位：亿元"],
+        [None, "地区", "合计", "财产保险", "寿险"],
+        [None, "全国合计", 45167.98, 11366.02, 24912.74],
+    ]
+    document = Document(
+        doc_id="national", title="2023年10月全国各地区原保险保费收入情况表",
+        authority=None, document_no=None, publish_date="2023-10-01",
+        effective_date=None, expire_date=None, document_type="excel", topic=[],
+        version=None, status="unknown", source_url=None, local_path="national.xlsx",
+        sha256="test", file_name="national.xlsx",
+    )
+
+    records = _cell_records(document, "各地区数据（月度）", rows)
+    numeric = {item.cell_address: item for item in records if item.cell_address in {"C4", "D4", "E4"}}
+
+    assert set(numeric) == {"C4", "D4", "E4"}
+    assert {item.unit for item in numeric.values()} == {"亿元"}
 
 
 def test_wps_legacy_doc_fallback_recovers_text_when_attachment_exists():

@@ -308,6 +308,29 @@ def _infer_unit(*values: Any) -> str | None:
     return match.group(1) if match else None
 
 
+def _infer_sheet_unit(rows: list[list[Any]], header_rows: int) -> str | None:
+    """Return a sheet-wide unit only when the header is unambiguous.
+
+    Some statistical workbooks place ``单位：亿元`` in a visually merged
+    cell above just one physical column.  Per-column header extraction then
+    loses the unit for neighbouring numeric cells.  Do not propagate when a
+    header also advertises count-like units because those sheets are mixed.
+    """
+    header = " ".join(
+        normalize_text(value)
+        for row in rows[:header_rows]
+        for value in row
+        if normalize_text(value)
+    )
+    if re.search(r"(?:万件|件|万户|户|家|个)", header):
+        return None
+    units = {
+        "%" if value in {"百分比", "%", "％"} else value
+        for value in re.findall(r"百分比|%|％|‰|万亿元|亿元|百万元|万元|元", header)
+    }
+    return next(iter(units)) if len(units) == 1 else None
+
+
 def _looks_like_quarter_matrix(rows: list[list[Any]], header_rows: int) -> bool:
     """Detect quarter blocks x indicator rows x institution columns."""
     if header_rows < 2 or max((len(row) for row in rows), default=0) < 3:
@@ -389,6 +412,7 @@ def _cell_records(doc: Document, sheet_name: str, rows: list[list[Any]], table_n
     if _looks_like_quarter_matrix(rows, header_rows):
         return _quarter_matrix_records(doc, sheet_name, rows, header_rows, headers, table_name)
     scoped_insurance_report = is_insurance_fund_table(doc.title, sheet_name, table_name)
+    sheet_unit = _infer_sheet_unit(rows, header_rows)
     active_scope = "保险业总体" if scoped_insurance_report else None
     for row_index, row in enumerate(rows, 1):
         row_header = first_nonempty(row[:2])
@@ -402,6 +426,8 @@ def _cell_records(doc: Document, sheet_name: str, rows: list[list[Any]], table_n
             period = _period_from_header(column_header) or _period_from_header(doc.title)
             unit = None
             unit = _infer_unit(column_header, row_header)
+            if unit is None and isinstance(value, (int, float)) and not isinstance(value, bool):
+                unit = sheet_unit
             address = _excel_address(row_index, column_index)
             context_parts = [active_scope, indicator, column_header, normalize_text(value)]
             context = " | ".join(str(part) for part in context_parts if part)

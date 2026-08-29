@@ -92,19 +92,14 @@ class GroundedGenerator:
             return GenerationResult("error", context_evidence_ids=tuple(evidence_ids), error="empty_evidence_context")
 
         system_prompt = (
-            "你是 BankReg-TrustRAG 的银行监管问答生成器。只能根据用户问题和 EVIDENCE_CONTEXT 回答。"
-            "不得补充证据中没有的数字、日期、机构、文号、条款或规范性结论。"
-            "必须保持证据中的‘应当、可以、不得、原则上’等规范强度。"
-            "统计值、比较关系和计算结果必须以 DETERMINISTIC_FACTS 为准，不要自行改算。"
-            "如果证据不足以回答，明确说明无法可靠回答。"
-            "最小证据是最小充分证据，不等于最短回答；普通回答通常控制在80至200个中文字，复杂跨文件问题可以更长。"
-            "选择题应依次给出明确答案、1至2句核心证据解释和最终结论；只有 EVIDENCE_CONTEXT 中存在明确反证时，"
-            "才可简要说明其他选项错误原因，严禁自行编造反选项理由。"
-            "表格比较题必须列出各选项的关键比较值，并以 DETERMINISTIC_FACTS 中的比较结果为准。"
-            "跨文件判断题必须分别说明规则文件提供的规则、数据文件提供的数据、比较过程与最终结论。"
-            "只输出清晰、直接的用户答案：不要复述完整问题，不要输出检索过程、信任分、耗时、"
-            "文件路径、Evidence ID 或 [证据: ...] 标记。证据会在界面的证据链区域单独展示。"
-            "统计表多期间查询时按期间分行列出结果；除非问题要求，否则不要添加背景说明。"
+            "你是 BankReg-TrustRAG 的 Evidence-Grounded Answer Agent。只能根据 USER_QUESTION、"
+            "EVIDENCE_CONTEXT 和 DETERMINISTIC_FACTS 回答；问题类型和意图字段只描述任务，不能作为事实来源。"
+            "不得补充证据中没有的数字、日期、机构、文号、条款或规范性事实；不得自行检索、重新计算或修改工具数字。"
+            "规范性强度必须忠实于证据，多个来源冲突时如实报告，证据不足时明确说明无法可靠判断。"
+            "由你根据用户真正的问题自由决定回答句式、结构、段落、表格、结论顺序和详略，不套用固定回答模板。"
+            "一致、接近、明显、增长或下降等业务语义由你根据证据和确定性结果作有依据的判断，Python工具不替你措辞；"
+            "不得把内部true/false原样输出给用户。"
+            "不要输出检索过程、Chain-of-Thought、信任分、耗时、文件路径、Evidence ID 或内部任务标记。"
         )
         user_prompt = "\n".join(
             [
@@ -249,7 +244,8 @@ def _safe_operations(operations: list[dict[str, Any]]) -> list[dict[str, Any]]:
         "type", "value", "values", "unit", "period", "formula", "threshold",
         "comparator", "confidence", "intent", "answer_format", "method",
         "selected_option", "selected_text", "comparison_summary", "data_source",
-        "rule_source",
+        "rule_source", "operation", "input_refs", "inputs", "result", "trace",
+        "details", "difference",
     }
     safe_operations: list[dict[str, Any]] = []
     for operation in operations:

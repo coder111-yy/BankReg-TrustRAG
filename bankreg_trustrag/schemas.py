@@ -102,14 +102,17 @@ class ParsedQuery:
 class Verification:
     numeric_ok: bool = True
     date_ok: bool = True
+    unit_ok: bool = True
     entity_ok: bool = True
     document_no_ok: bool = True
     normative_strength_ok: bool = True
     citation_ok: bool = True
+    completeness_ok: bool = True
     version_ok: bool = True
     unsupported_claims: list[str] = field(default_factory=list)
     conflicts: list[str] = field(default_factory=list)
     claim_results: list[dict[str, Any]] = field(default_factory=list)
+    failure_details: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def passed(self) -> bool:
@@ -117,10 +120,12 @@ class Verification:
             [
                 self.numeric_ok,
                 self.date_ok,
+                self.unit_ok,
                 self.entity_ok,
                 self.document_no_ok,
                 self.normative_strength_ok,
                 self.citation_ok,
+                self.completeness_ok,
                 self.version_ok,
             ]
         ) and not self.unsupported_claims and not self.conflicts

@@ -13,6 +13,23 @@
 - 前端采用“监管证据台账”风格，显示信任分、决策、追踪编号和证据链。
 - 选择题由 Choice Agent 先识别意图，再对 A/B/C/D 选项分别检索和逐项核验；证据不足或选项得分接近时转入人工确认，不自动猜测。
 - 可选接入本地或获授权的 OpenAI-compatible 大模型：检索到的最小证据集会进入上下文，模型回答必须经过 Claim、数字、日期和规范性用语核验；模型不可用或核验失败时回退到可审计的确定性答案。
+- 可通过 Feature Flag 启用 Agentic 查询规划：LLM 把完整问题拆成带结果绑定的检索任务和计算 DAG，现有 HybridIndex 与表格取值工具逐任务执行，最终回答再做完整性和事实核验。
+
+## Agentic 查询规划
+
+新路径采用显式有界状态机，暂不引入 LangGraph：
+
+```text
+完整用户问题
+  → LLM Query Planner（Structured QueryPlan）
+  → 按来源/指标/时间约束逐任务检索
+  → Decimal Calculator 执行求和、差值、同比、比较等操作
+  → 确定性检查每个 AnswerRequirement.required_outputs
+  → Grounded LLM Answer Generator
+  → 数字、日期、单位、引用和 Calculation Trace 核验
+```
+
+该路径不重写 BM25、BGE、RRF、Reranker、Metadata Filter 或 Excel Cell 检索。执行 Trace 会记录规划、检索、计算、完整性、核验和分阶段耗时；前端只显示“拆解任务、检索证据、执行计算、核验完成”等高层状态，不展示模型内部推理。
 
 ## 目录说明
 
@@ -69,6 +86,12 @@ BANKREG_LLM_PROVIDER=openai_compatible
 BANKREG_LLM_MODEL=你的模型名
 BANKREG_LLM_BASE_URL=http://127.0.0.1:11434/v1
 BANKREG_LLM_API_KEY=
+# 建议为查询规划单独配置轻量、非推理模型；URL/Key 留空时复用上面配置
+BANKREG_PLANNER_MODEL=你的轻量规划模型名
+BANKREG_PLANNER_BASE_URL=
+BANKREG_PLANNER_API_KEY=
+BANKREG_AGENTIC_PLANNER_ENABLED=true
+BANKREG_AGENTIC_PLANNER_FAILURE_MODE=legacy
 ```
 
 系统只把选中的证据文本、来源标题、页码/单元格位置和确定性计算事实发送到该地址，不发送本地文件路径。使用外部地址前，必须确认数据授权和合规要求。
@@ -138,7 +161,7 @@ Invoke-RestMethod http://127.0.0.1:8000/api/qa `
 .\.venv\Scripts\python.exe scripts\test_service.py
 ```
 
-烟测结果保存到 `artifacts/service_smoke_report.json`。当前完整测试结果为 `63 passed`；FastAPI 服务烟测的 8 项检查全部通过。
+烟测结果保存到 `artifacts/service_smoke_report.json`。测试结果必须以本机最新一次完整运行输出为准，不在文档中写死历史通过数。
 
 向其他授权使用者交付项目时，请优先发送不含数据和模型的复现包，并参考 [REPRODUCE.md](REPRODUCE.md)。
 

@@ -26,10 +26,23 @@ class Settings:
     llm_model: str | None = None
     llm_base_url: str | None = None
     llm_api_key: str | None = None
+    planner_model: str | None = None
+    planner_base_url: str | None = None
+    planner_api_key: str | None = None
     llm_timeout_seconds: float = 45.0
     llm_max_tokens: int = 800
     llm_temperature: float = 0.0
     llm_max_context_chars: int = 12000
+    llm_max_retries: int = 2
+    llm_planner_temperature: float = 0.0
+    llm_answer_temperature: float = 0.3
+    llm_planner_max_tokens: int = 2500
+    llm_answer_max_tokens: int = 4000
+    llm_planner_timeout_seconds: float = 60.0
+    llm_answer_timeout_seconds: float = 60.0
+    agentic_planner_enabled: bool = True
+    agentic_planner_failure_mode: str = "legacy"
+    agentic_max_answer_attempts: int = 2
 
     @classmethod
     def from_env(cls, root: Path | None = None) -> "Settings":
@@ -87,8 +100,21 @@ class Settings:
             # DeepSeek's familiar name so an existing .env does not silently
             # omit the Authorization header.
             llm_api_key=os.getenv("BANKREG_LLM_API_KEY") or os.getenv("DEEPSEEK_API_KEY") or None,
+            planner_model=os.getenv("BANKREG_PLANNER_MODEL") or None,
+            planner_base_url=os.getenv("BANKREG_PLANNER_BASE_URL") or None,
+            planner_api_key=os.getenv("BANKREG_PLANNER_API_KEY") or None,
             llm_timeout_seconds=float(os.getenv("BANKREG_LLM_TIMEOUT_SECONDS", os.getenv("BANKREG_LLM_TIMEOUT", "45"))),
             llm_max_tokens=int(os.getenv("BANKREG_LLM_MAX_TOKENS", "800")),
             llm_temperature=float(os.getenv("BANKREG_LLM_TEMPERATURE", "0")),
             llm_max_context_chars=int(os.getenv("BANKREG_CONTEXT_MAX_CHARS", os.getenv("BANKREG_LLM_MAX_CONTEXT_CHARS", "12000"))),
+            llm_max_retries=int(os.getenv("BANKREG_LLM_MAX_RETRIES", "2")),
+            llm_planner_temperature=float(os.getenv("BANKREG_LLM_PLANNER_TEMPERATURE", "0")),
+            llm_answer_temperature=float(os.getenv("BANKREG_LLM_ANSWER_TEMPERATURE", "0.3")),
+            llm_planner_max_tokens=int(os.getenv("BANKREG_LLM_PLANNER_MAX_TOKENS", "2500")),
+            llm_answer_max_tokens=int(os.getenv("BANKREG_LLM_ANSWER_MAX_TOKENS", "4000")),
+            llm_planner_timeout_seconds=float(os.getenv("BANKREG_LLM_PLANNER_TIMEOUT_SECONDS", "60")),
+            llm_answer_timeout_seconds=float(os.getenv("BANKREG_LLM_ANSWER_TIMEOUT_SECONDS", "60")),
+            agentic_planner_enabled=os.getenv("BANKREG_AGENTIC_PLANNER_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"},
+            agentic_planner_failure_mode=os.getenv("BANKREG_AGENTIC_PLANNER_FAILURE_MODE", "legacy").strip().lower(),
+            agentic_max_answer_attempts=int(os.getenv("BANKREG_AGENTIC_MAX_ANSWER_ATTEMPTS", "2")),
         )

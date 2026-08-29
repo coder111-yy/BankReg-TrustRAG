@@ -75,9 +75,9 @@ def test_generator_sends_retrieved_context_to_chat_endpoint(monkeypatch):
     assert "商业银行不得挪用客户资金" in request["json"]["messages"][1]["content"]
     system_prompt = request["json"]["messages"][0]["content"]
     user_prompt = request["json"]["messages"][1]["content"]
-    assert "最小充分证据" in system_prompt
-    assert "明确反证" in system_prompt
-    assert "规则文件提供的规则、数据文件提供的数据、比较过程与最终结论" in system_prompt
+    assert "自由决定回答句式、结构、段落、表格、结论顺序和详略" in system_prompt
+    assert "一致、接近、明显、增长或下降等业务语义由你" in system_prompt
+    assert "不套用固定回答模板" in system_prompt
     assert "INTENT: lookup" in user_prompt
     assert "ANSWER_FORMAT: free_text" in user_prompt
     assert "REQUIREMENTS:" in user_prompt
@@ -120,4 +120,4 @@ def test_service_accepts_only_verified_llm_answer():
 
     assert response.answer == "商业银行不得挪用客户资金。[证据: text:d1:p1]"
     assert response.query_plan["generation"]["status"] == "accepted"
-    assert response.query_plan["agent_workflow"]["answer_generation"]["strategy"] == "llm_grounded_with_deterministic_fallback"
+    assert response.query_plan["agent_workflow"]["answer_generation"]["strategy"] == "evidence_grounded_answer_agent"

@@ -1,0 +1,215 @@
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from typing import Any, TypeVar
+
+import httpx
+from pydantic import BaseModel, ValidationError
+
+
+ModelT = TypeVar("ModelT", bound=BaseModel)
+
+
+@dataclass(frozen=True)
+class LLMClientConfig:
+    provider: str = "none"
+    model: str | None = None
+    base_url: str | None = None
+    api_key: str | None = None
+    timeout_seconds: float = 45.0
+    max_tokens: int = 1600
+    max_retries: int = 2
+
+    @property
+    def enabled(self) -> bool:
+        return bool(
+            self.provider.lower() not in {"", "none", "disabled"}
+            and self.model
+            and self.base_url
+        )
+
+
+@dataclass(frozen=True)
+class StructuredLLMResult:
+    status: str
+    value: BaseModel | None = None
+    attempts: int = 0
+    error: str | None = None
+    errors: tuple[str, ...] = ()
+
+
+class LLMClient:
+    """Small OpenAI-compatible client shared by planning and generation."""
+
+    def __init__(self, config: LLMClientConfig):
+        self.config = config
+        self._json_schema_supported: bool | None = None
+
+    @classmethod
+    def from_settings(cls, settings: Any) -> "LLMClient":
+        return cls(LLMClientConfig(
+            provider=str(getattr(settings, "llm_provider", "none") or "none"),
+            model=getattr(settings, "llm_model", None),
+            base_url=getattr(settings, "llm_base_url", None),
+            api_key=getattr(settings, "llm_api_key", None),
+            timeout_seconds=float(getattr(settings, "llm_timeout_seconds", 45.0)),
+            max_tokens=int(getattr(settings, "llm_max_tokens", 1600)),
+            max_retries=max(0, int(getattr(settings, "llm_max_retries", 2))),
+        ))
+
+    @classmethod
+    def from_planner_settings(cls, settings: Any) -> "LLMClient":
+        """Build a dedicated planner client, preferring a light model config."""
+        return cls(LLMClientConfig(
+            provider=str(getattr(settings, "llm_provider", "none") or "none"),
+            model=(
+                getattr(settings, "planner_model", None)
+                or getattr(settings, "llm_model", None)
+            ),
+            base_url=(
+                getattr(settings, "planner_base_url", None)
+                or getattr(settings, "llm_base_url", None)
+            ),
+            api_key=(
+                getattr(settings, "planner_api_key", None)
+                or getattr(settings, "llm_api_key", None)
+            ),
+            timeout_seconds=float(getattr(settings, "llm_planner_timeout_seconds", 60.0)),
+            max_tokens=int(getattr(settings, "llm_planner_max_tokens", 2500)),
+            # Planner is deliberately bounded to one generation plus one JSON
+            # repair request, independent of the answer-generator retry count.
+            max_retries=1,
+        ))
+
+    @property
+    def enabled(self) -> bool:
+        return self.config.enabled
+
+    def structured(
+        self,
+        messages: list[dict[str, str]],
+        output_model: type[ModelT],
+        *,
+        temperature: float,
+        max_tokens: int | None = None,
+        timeout_seconds: float | None = None,
+        prefer_json_schema: bool = True,
+        max_attempts: int | None = None,
+    ) -> StructuredLLMResult:
+        if not self.enabled:
+            return StructuredLLMResult("disabled", error="llm_disabled")
+
+        validation_error: str | None = None
+        errors: list[str] = []
+        schema_text = json.dumps(output_model.model_json_schema(), ensure_ascii=False)
+        total_attempts = max(1, int(max_attempts or (self.config.max_retries + 1)))
+        for attempt in range(1, total_attempts + 1):
+            use_native_schema = (
+                prefer_json_schema
+                and attempt == 1
+                and self._json_schema_supported is not False
+            )
+            request_messages = list(messages)
+            if validation_error or not use_native_schema:
+                request_messages.append({
+                    "role": "user",
+                    "content": (
+                        "请只返回一个符合JSON Schema的JSON对象，"
+                        "不要使用Markdown代码块、不要增加Schema之外的字段。"
+                        f"校验错误：{(validation_error or 'provider_json_object_compatibility_mode')[:500]}\n"
+                        f"必须严格符合的JSON Schema：{schema_text}"
+                    ),
+                })
+            response_format: dict[str, Any]
+            if use_native_schema:
+                response_format = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": output_model.__name__,
+                        "strict": True,
+                        "schema": output_model.model_json_schema(),
+                    },
+                }
+            else:
+                # Some local OpenAI-compatible servers implement json_object
+                # but not json_schema. Pydantic remains the authority here.
+                response_format = {"type": "json_object"}
+            try:
+                text = self._post(
+                    request_messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    response_format=response_format,
+                    timeout_seconds=timeout_seconds,
+                )
+                payload = json.loads(text)
+                value = output_model.model_validate(payload)
+                if use_native_schema:
+                    self._json_schema_supported = True
+                return StructuredLLMResult("ok", value=value, attempts=attempt, errors=tuple(errors))
+            except json.JSONDecodeError as exc:
+                validation_error = f"invalid_json:{exc.msg}"
+            except ValidationError as exc:
+                validation_error = f"schema_validation:{exc}"
+            except httpx.HTTPStatusError as exc:
+                if use_native_schema and exc.response.status_code in {400, 404, 415, 422}:
+                    self._json_schema_supported = False
+                validation_error = type(exc).__name__
+            except (httpx.HTTPError, ValueError, TypeError, KeyError) as exc:
+                validation_error = f"{type(exc).__name__}:{str(exc)[:200]}"
+            errors.append(validation_error)
+        return StructuredLLMResult(
+            "error",
+            attempts=total_attempts,
+            error=validation_error or "structured_output_failed",
+            errors=tuple(errors),
+        )
+
+    def _post(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        temperature: float,
+        max_tokens: int | None,
+        response_format: dict[str, Any] | None = None,
+        timeout_seconds: float | None = None,
+    ) -> str:
+        payload: dict[str, Any] = {
+            "model": self.config.model,
+            "temperature": temperature,
+            "max_tokens": max_tokens or self.config.max_tokens,
+            "messages": messages,
+        }
+        if response_format:
+            payload["response_format"] = response_format
+        headers = {"Content-Type": "application/json"}
+        if self.config.api_key:
+            headers["Authorization"] = f"Bearer {self.config.api_key}"
+        response = httpx.post(
+            _chat_completions_url(str(self.config.base_url)),
+            headers=headers,
+            json=payload,
+            timeout=timeout_seconds or self.config.timeout_seconds,
+        )
+        response.raise_for_status()
+        return _response_text(response.json())
+
+
+def _chat_completions_url(base_url: str) -> str:
+    base = base_url.rstrip("/")
+    return base if base.endswith("/chat/completions") else f"{base}/chat/completions"
+
+
+def _response_text(body: dict[str, Any]) -> str:
+    choices = body.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise ValueError("missing_choices")
+    message = choices[0].get("message") or {}
+    content = message.get("content") if isinstance(message, dict) else None
+    if isinstance(content, list):
+        content = "".join(str(part.get("text") or "") for part in content if isinstance(part, dict))
+    text = str(content or "").strip()
+    if not text:
+        raise ValueError("empty_model_content")
+    return text
