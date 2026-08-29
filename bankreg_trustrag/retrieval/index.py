@@ -84,6 +84,15 @@ class HybridIndex:
             else None
         )
         self._text_vectors_ready = False
+        self._runtime_usage: dict[str, bool] = {
+            "bm25_used": False,
+            "metadata_filter_used": False,
+            "structured_table_used": False,
+            "bge_vector_used": False,
+            "bge_reranker_used": False,
+            "char_ngram_fallback_used": False,
+            "rrf_used": False,
+        }
         self.doc_by_id = {str(d["doc_id"]): d for d in self.documents}
         # Text evidence is only ~tens of thousands of rows, so keeping its BM25
         # token/DF structures in memory is reasonable.
@@ -162,6 +171,31 @@ class HybridIndex:
             }
         else:
             status["text_vector_index"] = None
+        return status
+
+    def begin_query(self) -> None:
+        """Reset per-request retrieval usage flags before a new QA run."""
+        for key in self._runtime_usage:
+            self._runtime_usage[key] = False
+
+    @property
+    def runtime_status(self) -> dict[str, Any]:
+        """Return actual capabilities used by the most recent request.
+
+        Configuration is deliberately kept separate from usage.  In ``auto``
+        mode a missing model may trigger the character fallback; that must not
+        be reported as a successful BGE route.
+        """
+        status = self.model_status
+        status.update({
+            "vector_index_available": bool(self._text_vector_index and self._text_vector_index.available),
+            "table_vector_strategy": (
+                "structured_prefilter_then_bge_similarity"
+                if self.semantic is not None
+                else "structured_prefilter_then_character_similarity"
+            ),
+            **self._runtime_usage,
+        })
         return status
 
     def _ensure_text_vectors(self) -> bool:
@@ -311,18 +345,40 @@ class HybridIndex:
 
         return percentages, numbers
 
-    def search_text(self, query: str, top_k: int = 8, filters: dict[str, Any] | None = None) -> list[Hit]:
-        q_tokens = tokens(query)
+    def search_text(
+        self,
+        query: str,
+        top_k: int = 8,
+        filters: dict[str, Any] | None = None,
+        *,
+        dense: bool = True,
+        lexical: bool = True,
+        metadata: bool = True,
+        fuse: bool = True,
+    ) -> list[Hit]:
+        q_tokens = tokens(query) if lexical else []
         query_percentages, query_numbers = self._numeric_terms(query)
         candidate_indices = self._candidate_indices("text", filters)
         allowed_ids = {str(self.text[index].get("evidence_id")) for index in candidate_indices}
         vector_scores: dict[str, float] = {}
-        if self.semantic and self._ensure_text_vectors() and self._text_vector_index:
+        using_persisted_bge = False
+        if dense and self.semantic and self._ensure_text_vectors() and self._text_vector_index:
+            using_persisted_bge = self._text_vector_index.available
             vector_scores = dict(self._text_vector_index.search(query, max(top_k * 4, 32), allowed_ids))
+            if vector_scores:
+                self._runtime_usage["bge_vector_used"] = True
+        elif dense and self.semantic and self.semantic.enabled:
+            self._runtime_usage["char_ngram_fallback_used"] = True
+        elif dense:
+            self._runtime_usage["char_ngram_fallback_used"] = True
+        if lexical:
+            self._runtime_usage["bm25_used"] = True
+        if metadata and filters:
+            self._runtime_usage["metadata_filter_used"] = True
         hits: list[Hit] = []
         for index in candidate_indices:
             item = self.text[index]
-            lexical = self._bm25(q_tokens, self._text_tokens, self._text_df, self._text_avg_len, index)
+            lexical_score = self._bm25(q_tokens, self._text_tokens, self._text_df, self._text_avg_len, index) if lexical else 0.0
             # 提取当前证据中的百分比和数字
             item_text = self._text_blob(item)
             item_percentages, item_numbers = self._numeric_terms(item_text)
@@ -351,13 +407,27 @@ class HybridIndex:
                 + 0.5 * len(plain_number_matches)
             )
 
-            lexical += numeric_bonus
-            dense = vector_scores.get(str(item.get("evidence_id")), self._dense(query, self._text_blob(item))) if self.semantic else self._dense(query, self._text_blob(item))
-            metadata = self._metadata(item, query, filters)
-            if lexical or dense or metadata:
-                hits.append(Hit("text", item, lexical, dense, metadata_score=metadata))
-        self._rrf(hits)
-        selected = sorted(hits, key=lambda hit: hit.fused_score, reverse=True)[:top_k]
+            if lexical:
+                lexical_score += numeric_bonus
+            if dense:
+                if using_persisted_bge:
+                    # Do not silently substitute character similarity for
+                    # corpus rows that were not in the persisted BGE top-k.
+                    # The vector route is either BGE or the explicit fallback.
+                    dense_score = vector_scores.get(str(item.get("evidence_id")), 0.0)
+                else:
+                    dense_score = self._dense(query, self._text_blob(item))
+            else:
+                dense_score = 0.0
+            metadata_score = self._metadata(item, query, filters) if metadata else 0.0
+            if lexical_score or dense_score or metadata_score:
+                hits.append(Hit("text", item, lexical_score, dense_score, metadata_score=metadata_score))
+        if fuse:
+            self._rrf(hits)
+            self._runtime_usage["rrf_used"] = True
+        else:
+            hits.sort(key=lambda hit: (hit.lexical_score, hit.dense_score, hit.metadata_score, hit.evidence_id), reverse=True)
+        selected = sorted(hits, key=lambda hit: (hit.fused_score, hit.lexical_score, hit.dense_score, hit.evidence_id), reverse=True)[:top_k] if fuse else hits[:top_k]
         for hit in selected:
             self._attach_text_context_window(hit)
         return selected
@@ -390,10 +460,23 @@ class HybridIndex:
                 str(item.get("content") or "") for item in neighbours if item.get("content")
             )
 
-    def search_tables(self, query: str, top_k: int = 8, filters: dict[str, Any] | None = None) -> list[Hit]:
+    def search_tables(
+        self,
+        query: str,
+        top_k: int = 8,
+        filters: dict[str, Any] | None = None,
+        *,
+        dense: bool = True,
+        lexical: bool = True,
+        metadata: bool = True,
+        fuse: bool = True,
+    ) -> list[Hit]:
         if self._table_provider is not None:
-            return self._search_tables_lazy(query, top_k, filters)
-        q_tokens = tokens(query)
+            return self._search_tables_lazy(query, top_k, filters, dense=dense, lexical=lexical, metadata=metadata, fuse=fuse)
+        q_tokens = tokens(query) if lexical else []
+        self._runtime_usage["structured_table_used"] = True
+        if metadata and filters:
+            self._runtime_usage["metadata_filter_used"] = True
         candidate_indices = self._candidate_indices("table", filters)
         requested_indicator = extract_indicator(query)
         normalized_indicator = normalize_text(requested_indicator).lower() if requested_indicator else None
@@ -504,8 +587,8 @@ class HybridIndex:
 
         for index in candidate_indices:
             item = self.tables[index]
-            lexical = self._table_lexical(q_tokens, item)
-            metadata = self._metadata(item, query, filters)
+            lexical_score = self._table_lexical(q_tokens, item) if lexical else 0.0
+            metadata_score = self._metadata(item, query, filters) if metadata else 0.0
             value = normalized_number(item.get("value_text"))
 
             table_score = (
@@ -545,16 +628,16 @@ class HybridIndex:
 
             # A cheap pre-score is enough to choose the shortlist.  BGE or the
             # model-free character score is applied only after this stage.
-            pre_score = 4.0 * table_score + lexical + 0.5 * metadata
+            pre_score = 4.0 * table_score + lexical_score + 0.5 * metadata_score
             if pre_score <= 0:
                 continue
 
             hit = Hit(
                 "table",
                 item,
-                lexical_score=lexical,
+                lexical_score=lexical_score,
                 dense_score=0.0,
-                metadata_score=metadata,
+                metadata_score=metadata_score,
                 table_score=table_score,
             )
             entry = (pre_score, index, hit)
@@ -567,19 +650,19 @@ class HybridIndex:
 
         # For a small already-filtered candidate set, keep a fallback path for
         # questions that had no exact lexical/structured hit.
-        if not hits and len(candidate_indices) <= 5000:
+        if not hits and dense and len(candidate_indices) <= 5000:
             fallback_k = min(prefilter_k, len(candidate_indices))
             fallback_heap: list[tuple[float, int, Hit]] = []
             for index in candidate_indices:
                 item = self.tables[index]
-                dense = self._dense(query, self._table_blob(item))
-                if dense <= 0:
+                fallback_score = self._dense(query, self._table_blob(item))
+                if fallback_score <= 0:
                     continue
-                hit = Hit("table", item, dense_score=dense)
-                entry = (dense, index, hit)
+                hit = Hit("table", item, dense_score=fallback_score)
+                entry = (fallback_score, index, hit)
                 if len(fallback_heap) < fallback_k:
                     heapq.heappush(fallback_heap, entry)
-                elif dense > fallback_heap[0][0]:
+                elif fallback_score > fallback_heap[0][0]:
                     heapq.heapreplace(fallback_heap, entry)
             hits = [entry[2] for entry in fallback_heap]
 
@@ -594,31 +677,39 @@ class HybridIndex:
             reverse=True,
         )[: max(top_k * 8, 64)]
 
-        if self.semantic:
+        if dense and self.semantic:
             scores = self.semantic.similarity(
                 query, [self._table_blob(hit.item) for hit in shortlist]
             )
             if scores is not None:
+                self._runtime_usage["bge_vector_used"] = True
                 for hit, score in zip(shortlist, scores):
                     hit.dense_score = score
             else:
+                self._runtime_usage["char_ngram_fallback_used"] = True
                 for hit in shortlist:
                     hit.dense_score = self._dense(query, self._table_blob(hit.item))
-        else:
+        elif dense:
+            self._runtime_usage["char_ngram_fallback_used"] = True
             for hit in shortlist:
                 hit.dense_score = self._dense(query, self._table_blob(hit.item))
+        else:
+            for hit in shortlist:
+                hit.dense_score = 0.0
 
-        self._rrf(shortlist)
-        return sorted(
-            shortlist,
-            key=lambda hit: (
-                hit.table_score,
-                hit.fused_score,
-                hit.lexical_score,
-                hit.dense_score,
-            ),
+        if fuse:
+            self._rrf(shortlist)
+            self._runtime_usage["rrf_used"] = True
+            return sorted(
+                shortlist,
+                key=lambda hit: (hit.fused_score, hit.table_score, hit.lexical_score, hit.dense_score, hit.evidence_id),
+                reverse=True,
+            )[:top_k]
+        shortlist.sort(
+            key=lambda hit: (hit.table_score, hit.lexical_score, hit.dense_score, hit.metadata_score, hit.evidence_id),
             reverse=True,
-        )[:top_k]
+        )
+        return shortlist[:top_k]
 
     def search_formula_evidence(self, indicator: str, top_k: int = 8, filters: dict[str, Any] | None = None, year: str | None = None) -> list[Hit]:
         """Retrieve formula cells that ordinary table top-k ranking can omit."""
@@ -728,7 +819,17 @@ class HybridIndex:
             fetch(text_terms=[term for term in re.findall(r"[\u4e00-\u9fffA-Za-z]{2,}", normalize_text(query))[:8]])
         return list(collected.values())
 
-    def _search_tables_lazy(self, query: str, top_k: int, filters: dict[str, Any] | None) -> list[Hit]:
+    def _search_tables_lazy(
+        self,
+        query: str,
+        top_k: int,
+        filters: dict[str, Any] | None,
+        *,
+        dense: bool,
+        lexical: bool,
+        metadata: bool,
+        fuse: bool,
+    ) -> list[Hit]:
         """Run the existing table scorer over only SQL-selected candidates."""
         items = self._lazy_table_candidates(query, filters)
         if not items:
@@ -743,31 +844,130 @@ class HybridIndex:
             semantic=self.semantic,
             vector_dir=None,
         )
-        return bounded.search_tables(query, top_k, filters)
+        result = bounded.search_tables(
+            query,
+            top_k,
+            filters,
+            dense=dense,
+            lexical=lexical,
+            metadata=metadata,
+            fuse=fuse,
+        )
+        for key, value in bounded._runtime_usage.items():
+            self._runtime_usage[key] = self._runtime_usage[key] or value
+        return result
 
     @staticmethod
     def _rrf(hits: list[Hit], k: int = 60) -> None:
-        # RRF-like fusion over lexical and dense rank lists; metadata/table bonuses
-        # remain visible in the score for auditability.
-        lexical_rank = {id(hit): rank for rank, hit in enumerate(sorted(hits, key=lambda x: x.lexical_score, reverse=True), 1) if hit.lexical_score > 0}
-        dense_rank = {id(hit): rank for rank, hit in enumerate(sorted(hits, key=lambda x: x.dense_score, reverse=True), 1) if hit.dense_score > 0}
-        for hit in hits:
-            hit.fused_score = (1 / (k + lexical_rank.get(id(hit), len(hits) + 1)) if id(hit) in lexical_rank else 0) + (1 / (k + dense_rank.get(id(hit), len(hits) + 1)) if id(hit) in dense_rank else 0) + 0.15 * hit.metadata_score + 0.25 * hit.table_score
+        """Fuse the four retrieval routes into one deterministic RRF score.
 
-    def hybrid_search(self, query: str, qa_type: str, top_k: int = 8, filters: dict[str, Any] | None = None) -> list[Hit]:
-        text_hits = self.search_text(query, top_k * 2, filters)
-        table_hits = self.search_tables(query, top_k * 2, filters) if qa_type in {"table_lookup", "cross_file_judgment"} or not self.text else []
+        ``table_score`` is the structured-table route and
+        ``metadata_score`` is the metadata-filter route.  All routes use the
+        same rank-fusion scale; raw BM25, cosine and heuristic table scores
+        are never compared directly.
+        """
+        def rank_by(attribute: str) -> dict[int, int]:
+            ranked = sorted(
+                hits,
+                key=lambda item: (getattr(item, attribute), item.evidence_id),
+                reverse=True,
+            )
+            return {
+                id(hit): rank
+                for rank, hit in enumerate(ranked, 1)
+                if getattr(hit, attribute) > 0
+            }
+
+        route_ranks = {
+            attribute: rank_by(attribute)
+            for attribute in ("lexical_score", "dense_score", "metadata_score", "table_score")
+        }
+        # Structured table evidence is a more selective route than generic
+        # lexical/semantic similarity. A modest weight keeps an exact
+        # indicator+period+column match ahead of a merely related text cell
+        # while remaining rank-based (not raw-score based).
+        route_weights = {
+            "lexical_score": 1.0,
+            "dense_score": 1.0,
+            "metadata_score": 0.5,
+            "table_score": 3.0,
+        }
+        for hit in hits:
+            hit.fused_score = sum(
+                route_weights[attribute] / (k + ranks[id(hit)])
+                for attribute, ranks in route_ranks.items()
+                if id(hit) in ranks
+            )
+
+    @staticmethod
+    def _sort_without_fusion(hits: list[Hit], top_k: int) -> list[Hit]:
+        return sorted(
+            hits,
+            key=lambda hit: (
+                hit.lexical_score,
+                hit.dense_score,
+                hit.metadata_score,
+                hit.table_score,
+                hit.evidence_id,
+            ),
+            reverse=True,
+        )[:top_k]
+
+    def hybrid_search(
+        self,
+        query: str,
+        qa_type: str,
+        top_k: int = 8,
+        filters: dict[str, Any] | None = None,
+        *,
+        rerank: bool = True,
+        dense: bool = True,
+        lexical: bool = True,
+        metadata: bool = True,
+        structured: bool = True,
+    ) -> list[Hit]:
+        """Run lexical/dense/metadata/structured retrieval and unified RRF.
+
+        ``rerank`` and ``dense`` are explicit controls so specialised agents
+        can avoid duplicate CrossEncoder work or run a genuine ablation.
+        """
+        route_top_k = max(top_k * 4, 32)
+        effective_filters = filters if metadata else None
+        text_hits = self.search_text(
+            query,
+            route_top_k,
+            effective_filters,
+            dense=dense,
+            lexical=lexical,
+            metadata=metadata,
+            fuse=False,
+        )
+        table_hits = self.search_tables(
+            query,
+            route_top_k,
+            effective_filters,
+            dense=dense,
+            lexical=lexical,
+            metadata=metadata,
+            fuse=False,
+        ) if structured and (qa_type in {"table_lookup", "cross_file_judgment"} or not self.text) else []
+        if table_hits:
+            self._runtime_usage["structured_table_used"] = True
         combined: dict[str, Hit] = {}
         for hit in text_hits + table_hits:
             previous = combined.get(hit.evidence_id)
             if not previous or hit.fused_score > previous.fused_score:
                 combined[hit.evidence_id] = hit
-        candidates = sorted(combined.values(), key=lambda hit: hit.fused_score, reverse=True)
-        if self.semantic and candidates:
+        candidates = list(combined.values())
+        self._rrf(candidates)
+        self._runtime_usage["rrf_used"] = True
+        candidates.sort(key=lambda hit: (hit.fused_score, hit.evidence_id), reverse=True)
+        if rerank and self.semantic and candidates:
             rerank_limit = min(len(candidates), max(top_k * 2, self.semantic.config.rerank_top_k))
             rerank_candidates = candidates[:rerank_limit]
             scores = self.semantic.rerank(query, [self._hit_blob(hit) for hit in rerank_candidates])
             if scores is not None:
+                self._runtime_usage["bge_reranker_used"] = True
                 base_max = max((hit.fused_score for hit in rerank_candidates), default=1.0) or 1.0
                 for hit, score in zip(rerank_candidates, scores):
                     hit.rerank_score = score

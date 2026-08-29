@@ -38,15 +38,26 @@ class RetrievalTools:
             task.semantic_constraints.row_label,
             task.semantic_constraints.column_label,
         ])
+        search_type = "table_lookup" if expects_table else "regulatory_fact"
         if expects_table:
             # The SQL-backed index returns a bounded shortlist, but wide
             # workbooks can place the numeric cell below many label/note
             # cells. Keep a larger wrapper-level candidate window, then apply
             # the task's explicit semantic constraints and numeric validation.
-            hits = self.index.search_tables(query, max(self.top_k, 128), filters or None)
+            search = getattr(self.index, "hybrid_search", None)
+            hits = (
+                search(query, search_type, max(self.top_k, 128), filters or None)
+                if callable(search)
+                else self.index.search_tables(query, max(self.top_k, 128), filters or None)
+            )
             hits = [hit for hit in hits if _matches_semantic_constraints(hit, task, self.index)]
             return _table_result(task, hits, self.index)
-        hits = self.index.search_text(query, self.top_k, filters or None)
+        search = getattr(self.index, "hybrid_search", None)
+        hits = (
+            search(query, search_type, self.top_k, filters or None)
+            if callable(search)
+            else self.index.search_text(query, self.top_k, filters or None)
+        )
         hits = [hit for hit in hits if _matches_semantic_constraints(hit, task, self.index)]
         hits = _expand_structural_text_neighbours(hits, self.index)
         return _text_result(task, hits, self.index)

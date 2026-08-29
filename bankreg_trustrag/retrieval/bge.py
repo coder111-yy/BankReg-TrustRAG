@@ -47,13 +47,26 @@ class BGEPipeline:
         return self.config.mode != "disabled"
 
     @property
+    def embedding_loaded(self) -> bool:
+        """Whether the embedding model has actually loaded successfully."""
+        return self._embedder is not None
+
+    @property
+    def reranker_loaded(self) -> bool:
+        """Whether the cross-encoder has actually loaded successfully."""
+        return self._reranker is not None
+
+    @property
     def status(self) -> dict[str, Any]:
         return {
             "mode": self.config.mode,
             "embedding_model": self.config.embedding_model,
             "reranker_model": self.config.reranker_model,
-            "embedding_loaded": self._embedder is not None,
-            "reranker_loaded": self._reranker is not None,
+            "embedding_loaded": self.embedding_loaded,
+            "reranker_loaded": self.reranker_loaded,
+            "embedding_available": self.embedding_loaded,
+            "reranker_available": self.reranker_loaded,
+            "reranker_score_calibration": "sigmoid(logit) for binary relevance",
             "error": self._error,
         }
 
@@ -192,19 +205,46 @@ class BGEPipeline:
         model = self._load_reranker()
         if model is None or not texts:
             return None
-        raw = model.predict(
-            [(query, text) for text in texts],
-            batch_size=self.config.batch_size,
-            show_progress_bar=False,
-        )
-        # BGE rerankers may return logits or probabilities. Convert logits to
-        # [0, 1] so the score can be audited alongside retrieval scores.
+        pairs = [(query, text) for text in texts]
+        # BGE cross-encoders are binary relevance models.  Ask the installed
+        # sentence-transformers version to apply sigmoid explicitly instead of
+        # guessing from the numeric range of the output: a logit can itself be
+        # between 0 and 1, so range-based detection is not reliable.
+        used_explicit_activation = True
+        try:
+            import torch
+
+            raw = model.predict(
+                pairs,
+                batch_size=self.config.batch_size,
+                show_progress_bar=False,
+                activation_fn=torch.sigmoid,
+            )
+        except TypeError:
+            # Compatibility with older CrossEncoder implementations that do
+            # not expose activation_fn. Their output is handled defensively
+            # below, but this path is explicitly a compatibility fallback.
+            used_explicit_activation = False
+            raw = model.predict(
+                pairs,
+                batch_size=self.config.batch_size,
+                show_progress_bar=False,
+            )
         result: list[float] = []
         for value in raw:
+            # Some versions return one-element arrays/tensors for a
+            # single-label model. Convert those to a scalar consistently.
+            if hasattr(value, "item"):
+                value = value.item()
+            elif isinstance(value, (list, tuple)):
+                value = value[0] if value else 0.0
             score = float(value)
-            if score < 0.0 or score > 1.0:
+            # Current sentence-transformers accepts activation_fn and has
+            # already applied sigmoid. Older versions return the raw binary
+            # logit by default; calibrate that path with the same sigmoid.
+            if not used_explicit_activation:
                 score = 1.0 / (1.0 + math.exp(-max(-60.0, min(60.0, score))))
-            result.append(score)
+            result.append(max(0.0, min(1.0, score)))
         return result
 
 

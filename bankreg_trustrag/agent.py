@@ -9,6 +9,7 @@ structured Human-in-the-loop handoff when the evidence is insufficient.
 from __future__ import annotations
 
 import json
+import inspect
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -540,11 +541,14 @@ def _agent_search(
     rerank: bool,
     dense: bool,
 ) -> list[Hit]:
-    """Use rerank control when available while keeping fixture compatibility."""
-    try:
+    """Use explicit retrieval controls without masking implementation errors."""
+    parameters = inspect.signature(index.hybrid_search).parameters
+    if "rerank" in parameters and "dense" in parameters:
         return index.hybrid_search(query, qa_type, top_k, filters, rerank=rerank, dense=dense)
-    except TypeError:
-        return index.hybrid_search(query, qa_type, top_k, filters)
+    # Small test doubles and downstream integrations written against the old
+    # four-argument contract remain usable, but only this compatibility branch
+    # omits the controls. Do not catch arbitrary TypeError from the real call.
+    return index.hybrid_search(query, qa_type, top_k, filters)
 
 
 def _merge_option_hits(*groups: list[Hit]) -> list[Hit]:

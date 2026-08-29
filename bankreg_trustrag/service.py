@@ -78,6 +78,8 @@ class TrustRAGService:
     ) -> QAResponse:
         """Dispatch through the feature-flagged agentic planner or legacy path."""
         request_started = time.perf_counter()
+        if hasattr(self.index, "begin_query"):
+            self.index.begin_query()
         _, inline_choices = extract_inline_choices(question)
         has_choices = bool(valid_choices(choices or inline_choices))
         if bool(getattr(self.settings, "agentic_planner_enabled", False)) and not has_choices:
@@ -254,7 +256,15 @@ class TrustRAGService:
             "answer_format": "free_text",
             "requirements": requirements,
             "entities": plan.entities.model_dump(),
-            "retrieval_routes": ["agentic_tasks", "bm25", "metadata", "bge_vector", "structured_table"],
+            "retrieval_routes": [
+                "agentic_tasks",
+                *_active_retrieval_routes(self.index),
+            ],
+            "runtime_status": (
+                self.index.runtime_status
+                if hasattr(self.index, "runtime_status")
+                else {"mode": "unknown"}
+            ),
             "retrieved_evidence_ids": [hit.evidence_id for hit in state.hits],
             "minimal_evidence_ids": [hit.evidence_id for hit in display_hits],
             "operations": operations,
@@ -383,7 +393,7 @@ class TrustRAGService:
         requirements = parsed.requirements
         retrieval_qa_type = "table_lookup" if requirements["table"] else parsed.qa_type
         retrieval_k = max(self.settings.top_k, 32) if requirements["table"] else self.settings.top_k
-        report("retrieving", label="正在检索本地制度与统计资料", routes=["bm25", "metadata", "bge_vector"])
+        report("retrieving", label="正在检索本地制度与统计资料")
         if requirements["multi_file"]:
             # Multi-file retrieval is a general capability.  Search each named
             # source independently before merging so one high-scoring document
@@ -627,14 +637,13 @@ class TrustRAGService:
         trace_id = "trace_" + uuid.uuid4().hex[:16]
         latency = int((time.perf_counter() - started) * 1000)
         evidence = _response_evidence(display_hits, draft.operations)
-        retrieval_routes = ["bm25", "metadata"]
-        semantic = getattr(self, "semantic", None)
-        if semantic is not None and semantic.enabled:
-            retrieval_routes.append("bge_vector")
-            retrieval_routes.append("bge_reranker")
-        else:
-            retrieval_routes.append("char_ngram_fallback")
-        if parsed.requires_table:
+        runtime_status = (
+            self.index.runtime_status
+            if hasattr(self.index, "runtime_status")
+            else {"mode": "unknown"}
+        )
+        retrieval_routes = _active_retrieval_routes(self.index)
+        if parsed.requires_table and "structured_table" not in retrieval_routes:
             retrieval_routes.append("structured_table")
         if requirements["multi_file"]:
             retrieval_routes.append("multi_file")
@@ -652,6 +661,7 @@ class TrustRAGService:
             "retrieval_routes": retrieval_routes,
             "retrieval_qa_type": retrieval_qa_type,
             "model_status": self.index.model_status if hasattr(self.index, "model_status") else {"mode": "unknown"},
+            "runtime_status": runtime_status,
             "generation": llm_generation,
             "retrieved_evidence_ids": [hit.evidence_id for hit in hits],
             # A multi-quarter table lookup deliberately carries one exact cell
@@ -1251,6 +1261,23 @@ def _answer_generation_strategy(operations: list[dict[str, Any]]) -> str:
     if any(operation.get("type") == "cross_file_judgment" for operation in operations):
         return "deterministic_cross_file_explanation"
     return "grounded_deterministic_template"
+
+
+def _active_retrieval_routes(index: Any) -> list[str]:
+    """Translate actual per-request usage flags into public route labels."""
+    status = getattr(index, "runtime_status", None)
+    if not isinstance(status, dict):
+        return []
+    mapping = (
+        ("bm25_used", "bm25"),
+        ("metadata_filter_used", "metadata"),
+        ("bge_vector_used", "bge_vector"),
+        ("bge_reranker_used", "bge_reranker"),
+        ("char_ngram_fallback_used", "char_ngram_fallback"),
+        ("rrf_used", "rrf"),
+        ("structured_table_used", "structured_table"),
+    )
+    return [label for key, label in mapping if status.get(key)]
 
 
 def _agentic_qa_type(plan: QueryPlan) -> str:
