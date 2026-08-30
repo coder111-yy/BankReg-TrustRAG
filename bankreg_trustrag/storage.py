@@ -11,19 +11,26 @@ CREATE TABLE IF NOT EXISTS documents (
   doc_id TEXT PRIMARY KEY, title TEXT NOT NULL, authority TEXT, document_no TEXT,
   publish_date TEXT, effective_date TEXT, expire_date TEXT, document_type TEXT,
   topic_json TEXT, version TEXT, status TEXT, source_url TEXT, local_path TEXT,
-  sha256 TEXT NOT NULL, file_name TEXT NOT NULL
+  sha256 TEXT NOT NULL, file_name TEXT NOT NULL,
+  family_title TEXT, parent_title TEXT, attachment_no TEXT, attachment_title TEXT,
+  reporting_period TEXT, regulatory_topic_json TEXT, business_domain_json TEXT,
+  authority_source TEXT, document_no_source TEXT, referenced_document_nos_json TEXT,
+  source_collection TEXT, metadata_quality REAL, is_regulatory_document INTEGER
 );
 CREATE TABLE IF NOT EXISTS text_evidence (
   evidence_id TEXT PRIMARY KEY, doc_id TEXT NOT NULL, content TEXT NOT NULL,
   page INTEGER, chapter TEXT, article_no TEXT, paragraph_no INTEGER, section TEXT,
-  source_url TEXT, source_location TEXT,
+  source_url TEXT, source_location TEXT, content_type TEXT,
   FOREIGN KEY(doc_id) REFERENCES documents(doc_id)
 );
 CREATE TABLE IF NOT EXISTS table_evidence (
   evidence_id TEXT PRIMARY KEY, doc_id TEXT NOT NULL, sheet_name TEXT NOT NULL,
   table_name TEXT, indicator TEXT, period TEXT, value_text TEXT, unit TEXT,
   row_header TEXT, column_header TEXT, cell_address TEXT NOT NULL, context TEXT,
-  source_url TEXT,
+  source_url TEXT, cell_type TEXT, numeric_value REAL, statistical_scope TEXT,
+  year INTEGER, quarter INTEGER, month INTEGER,
+  raw_value_text TEXT, display_value TEXT, value_scale REAL,
+  institution TEXT, region TEXT, insurance_type TEXT, dimension_labels_json TEXT,
   FOREIGN KEY(doc_id) REFERENCES documents(doc_id)
 );
 CREATE TABLE IF NOT EXISTS qa_records (
@@ -60,6 +67,12 @@ CREATE INDEX IF NOT EXISTS idx_text_doc ON text_evidence(doc_id);
 CREATE INDEX IF NOT EXISTS idx_table_doc ON table_evidence(doc_id);
 CREATE INDEX IF NOT EXISTS idx_table_indicator ON table_evidence(indicator);
 CREATE INDEX IF NOT EXISTS idx_table_period ON table_evidence(period);
+CREATE INDEX IF NOT EXISTS idx_table_cell_type ON table_evidence(cell_type);
+CREATE INDEX IF NOT EXISTS idx_table_numeric_value ON table_evidence(numeric_value);
+CREATE INDEX IF NOT EXISTS idx_table_institution ON table_evidence(institution);
+CREATE INDEX IF NOT EXISTS idx_table_region ON table_evidence(region);
+CREATE INDEX IF NOT EXISTS idx_document_family ON documents(family_title);
+CREATE INDEX IF NOT EXISTS idx_document_reporting_period ON documents(reporting_period);
 CREATE INDEX IF NOT EXISTS idx_relation_source ON document_relations(source_doc_id);
 CREATE INDEX IF NOT EXISTS idx_relation_target ON document_relations(target_doc_id);
 CREATE INDEX IF NOT EXISTS idx_conversation_scope ON conversations(memory_scope_id, updated_at DESC);
@@ -75,6 +88,43 @@ class Store:
         self.connection = sqlite3.connect(str(path), check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
         self.connection.executescript(SCHEMA)
+        self._ensure_ingestion_columns()
+
+    def _ensure_ingestion_columns(self) -> None:
+        """Add task-1 metadata columns to an existing SQLite file in place."""
+        additions = {
+            "documents": {
+                "family_title": "TEXT", "parent_title": "TEXT", "attachment_no": "TEXT",
+                "attachment_title": "TEXT", "reporting_period": "TEXT",
+                "regulatory_topic_json": "TEXT", "business_domain_json": "TEXT",
+                "authority_source": "TEXT", "document_no_source": "TEXT",
+                "referenced_document_nos_json": "TEXT", "source_collection": "TEXT",
+                "metadata_quality": "REAL", "is_regulatory_document": "INTEGER",
+            },
+            "text_evidence": {"content_type": "TEXT"},
+            "table_evidence": {
+                "cell_type": "TEXT", "numeric_value": "REAL", "statistical_scope": "TEXT",
+                "year": "INTEGER", "quarter": "INTEGER", "month": "INTEGER",
+                "raw_value_text": "TEXT", "display_value": "TEXT", "value_scale": "REAL",
+                "institution": "TEXT", "region": "TEXT", "insurance_type": "TEXT",
+                "dimension_labels_json": "TEXT",
+            },
+        }
+        with self.connection:
+            for table, columns in additions.items():
+                existing = {
+                    str(row[1])
+                    for row in self.connection.execute(f"PRAGMA table_info({table})").fetchall()
+                }
+                for column, sql_type in columns.items():
+                    if column not in existing:
+                        self.connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
+            self.connection.execute("CREATE INDEX IF NOT EXISTS idx_table_cell_type ON table_evidence(cell_type)")
+            self.connection.execute("CREATE INDEX IF NOT EXISTS idx_table_numeric_value ON table_evidence(numeric_value)")
+            self.connection.execute("CREATE INDEX IF NOT EXISTS idx_table_institution ON table_evidence(institution)")
+            self.connection.execute("CREATE INDEX IF NOT EXISTS idx_table_region ON table_evidence(region)")
+            self.connection.execute("CREATE INDEX IF NOT EXISTS idx_document_family ON documents(family_title)")
+            self.connection.execute("CREATE INDEX IF NOT EXISTS idx_document_reporting_period ON documents(reporting_period)")
 
     def close(self) -> None:
         self.connection.close()
@@ -88,28 +138,58 @@ class Store:
         with self.connection:
             for record in _read_jsonl(artifact_dir / "documents.jsonl"):
                 self.connection.execute(
-                    "INSERT OR REPLACE INTO documents VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    """INSERT OR REPLACE INTO documents(
+                        doc_id,title,authority,document_no,publish_date,effective_date,expire_date,
+                        document_type,topic_json,version,status,source_url,local_path,sha256,file_name,
+                        family_title,parent_title,attachment_no,attachment_title,reporting_period,
+                        regulatory_topic_json,business_domain_json,authority_source,document_no_source,
+                        referenced_document_nos_json,source_collection,metadata_quality,is_regulatory_document
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         record["doc_id"], record["title"], record.get("authority"), record.get("document_no"),
                         record.get("publish_date"), record.get("effective_date"), record.get("expire_date"),
                         record.get("document_type"), json.dumps(record.get("topic", []), ensure_ascii=False),
                         record.get("version"), record.get("status"), record.get("source_url"), record.get("local_path"),
-                        record["sha256"], record["file_name"],
+                        record["sha256"], record["file_name"], record.get("family_title"),
+                        record.get("parent_title"), record.get("attachment_no"), record.get("attachment_title"),
+                        record.get("reporting_period"), json.dumps(record.get("regulatory_topic", []), ensure_ascii=False),
+                        json.dumps(record.get("business_domain", []), ensure_ascii=False), record.get("authority_source"),
+                        record.get("document_no_source"),
+                        json.dumps(record.get("referenced_document_nos", []), ensure_ascii=False),
+                        record.get("source_collection"), record.get("metadata_quality"),
+                        1 if record.get("is_regulatory_document") else 0,
                     ),
                 )
             for record in _read_jsonl(artifact_dir / "text_evidence.jsonl"):
                 self.connection.execute(
-                    "INSERT OR REPLACE INTO text_evidence VALUES (?,?,?,?,?,?,?,?,?,?)",
-                    tuple(record.get(key) for key in ["evidence_id", "doc_id", "content", "page", "chapter", "article_no", "paragraph_no", "section", "source_url", "source_location"]),
+                    """INSERT OR REPLACE INTO text_evidence(
+                        evidence_id,doc_id,content,page,chapter,article_no,paragraph_no,section,
+                        source_url,source_location,content_type
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                    tuple(record.get(key) for key in [
+                        "evidence_id", "doc_id", "content", "page", "chapter", "article_no",
+                        "paragraph_no", "section", "source_url", "source_location", "content_type",
+                    ]),
                 )
             for record in _read_jsonl(artifact_dir / "table_evidence.jsonl"):
                 self.connection.execute(
-                    "INSERT OR REPLACE INTO table_evidence VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    """INSERT OR REPLACE INTO table_evidence(
+                        evidence_id,doc_id,sheet_name,table_name,indicator,period,value_text,unit,
+                        row_header,column_header,cell_address,context,source_url,cell_type,numeric_value,
+                        statistical_scope,year,quarter,month,raw_value_text,display_value,value_scale,
+                        institution,region,insurance_type,dimension_labels_json
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         record.get("evidence_id"), record.get("doc_id"), record.get("sheet_name"), record.get("table_name"),
                         record.get("indicator"), record.get("period"), json.dumps(record.get("value"), ensure_ascii=False),
                         record.get("unit"), record.get("row_header"), record.get("column_header"), record.get("cell_address"),
-                        record.get("context"), record.get("source_url"),
+                        record.get("context"), record.get("source_url"), record.get("cell_type"),
+                        record.get("numeric_value"), record.get("statistical_scope"), record.get("year"),
+                        record.get("quarter"), record.get("month"),
+                        json.dumps(record.get("raw_value"), ensure_ascii=False),
+                        record.get("display_value"), record.get("value_scale"),
+                        record.get("institution"), record.get("region"), record.get("insurance_type"),
+                        json.dumps(record.get("dimension_labels", []), ensure_ascii=False),
                     ),
                 )
             for record in _read_jsonl(artifact_dir / "document_relations.jsonl"):
@@ -151,6 +231,8 @@ class Store:
         periods: list[str] | None = None,
         row_label: str | None = None,
         column_label: str | None = None,
+        institution: str | None = None,
+        region: str | None = None,
         value_terms: list[str] | None = None,
         text_terms: list[str] | None = None,
         limit: int = 8000,
@@ -185,6 +267,14 @@ class Store:
             clauses.append("(column_header LIKE ? OR context LIKE ?)")
             wildcard = f"%{column_label}%"
             params.extend([wildcard, wildcard])
+        if institution:
+            clauses.append("(institution = ? OR column_header LIKE ? OR context LIKE ?)")
+            wildcard = f"%{institution}%"
+            params.extend([institution, wildcard, wildcard])
+        if region:
+            clauses.append("(region = ? OR row_header LIKE ? OR context LIKE ?)")
+            wildcard = f"%{region}%"
+            params.extend([region, wildcard, wildcard])
         for field, terms in (("value_text", value_terms), ("context", text_terms)):
             clean_terms = [str(term).strip() for term in (terms or []) if str(term).strip()]
             if clean_terms:
