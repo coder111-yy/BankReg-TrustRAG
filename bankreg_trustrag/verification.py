@@ -81,12 +81,16 @@ def verify_claims(
     calculation_numbers = _deterministic_result_numbers(operations)
     allowed_numbers = [*evidence_numbers, *calculation_numbers]
     for number in answer_numbers:
-        if not any(_decimal_equal(number, expected) for expected in allowed_numbers):
+        claim_text = _claim_containing_number(claims, number) or normalize_text(answer)
+        if not any(
+            _supported_numeric_rendering(number, expected, question=question, claim=claim_text)
+            for expected in allowed_numbers
+        ):
             verification.numeric_ok = False
             rendered = _decimal_text(number)
             _record_failure(
                 verification,
-                claim=_claim_containing_number(claims, number) or normalize_text(answer),
+                claim=claim_text,
                 error_type="unsupported_number",
                 expected={"allowed_numbers": [_decimal_text(value) for value in allowed_numbers]},
                 actual=rendered,
@@ -263,7 +267,13 @@ def _calculation_support(
             continue
         operation_numbers = _deterministic_result_numbers([operation])
         numeric_match = bool(operation_numbers) and any(
-            _decimal_equal(claim_number, operation_number)
+            _supported_numeric_rendering(
+                claim_number,
+                operation_number,
+                question="",
+                claim=claim,
+                allow_display_rounding=True,
+            )
             for claim_number in claim_numbers
             for operation_number in operation_numbers
         )
@@ -505,6 +515,55 @@ def _decimal_equal(actual: Decimal, expected: Decimal) -> bool:
         return True
     tolerance = max(Decimal("1e-12"), abs(expected) * Decimal("1e-12"))
     return abs(actual - expected) <= tolerance
+
+
+_APPROXIMATION_TERMS = ("约", "大约", "左右", "近似", "约为", "约等于")
+_NEGATIVE_DIRECTION_TERMS = ("下降", "减少", "降低", "下滑", "回落", "收窄", "减少了", "下降了")
+
+
+def _supported_numeric_rendering(
+    actual: Decimal,
+    expected: Decimal,
+    *,
+    question: str,
+    claim: str,
+    allow_display_rounding: bool = False,
+) -> bool:
+    """Accept faithful display forms without weakening provenance checks.
+
+    Evidence/calculator values remain authoritative. The answer may only change
+    display precision, or express a negative result as a positive magnitude
+    together with an explicit negative direction such as ``下降251.14``.
+    """
+    if _decimal_equal(actual, expected):
+        return True
+
+    context = normalize_text(f"{question} {claim}")
+    approximate = allow_display_rounding or any(term in context for term in _APPROXIMATION_TERMS)
+
+    if approximate and _display_rounding_equal(actual, expected):
+        return True
+
+    if expected < 0 and actual >= 0 and any(term in context for term in _NEGATIVE_DIRECTION_TERMS):
+        magnitude = abs(expected)
+        if _decimal_equal(actual, magnitude):
+            return True
+        if approximate and _display_rounding_equal(actual, magnitude):
+            return True
+
+    return False
+
+
+def _display_rounding_equal(actual: Decimal, expected: Decimal) -> bool:
+    """Accept only a normal Decimal rounding of an already-grounded value."""
+    exponent = actual.as_tuple().exponent
+    places = max(0, -exponent)
+    quantum = Decimal(1).scaleb(-places)
+    try:
+        rounded = expected.quantize(quantum)
+    except InvalidOperation:
+        return False
+    return actual == rounded
 
 
 def _decimal_text(value: Decimal) -> str:

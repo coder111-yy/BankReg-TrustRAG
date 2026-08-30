@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from .query_plan import RetrievalCandidate, RetrievalResult, RetrievalTask
@@ -19,6 +20,7 @@ from .utils import (
 class RetrievalExecution:
     result: RetrievalResult
     hits: list[Hit]
+    diagnostics: dict[str, Any] = field(default_factory=dict)
 
 
 class RetrievalTools:
@@ -27,40 +29,497 @@ class RetrievalTools:
     def __init__(self, index: Any, top_k: int = 12):
         self.index = index
         self.top_k = max(4, int(top_k))
+        # Built lazily from the already-ingested corpus.  It avoids repeatedly
+        # scanning every paragraph when several files share the same logical
+        # title (for example one regulation plus dozens of attachments).
+        self._document_route_profile_cache: dict[str, list[str]] | None = None
 
     def execute(self, task: RetrievalTask) -> RetrievalExecution:
+        """Execute one retrieval action.
+
+        ``precise`` preserves the planner constraints. ``broad`` keeps those
+        terms in the semantic query but does not let uncertain metadata or
+        structured fields eliminate every candidate. The adaptive agent can
+        therefore react to a failed precise search by explicitly choosing a
+        broader next action instead of receiving an immediate refusal.
+        """
         task = _normalized_task(task)
         query = _task_query(task)
-        filters = _task_filters(task)
-        expects_table = task.expected_value_type in {"number", "table_cell"} or any([
-            task.semantic_constraints.indicator,
-            task.semantic_constraints.parent_indicator,
-            task.semantic_constraints.row_label,
-            task.semantic_constraints.column_label,
-        ])
-        search_type = "table_lookup" if expects_table else "regulatory_fact"
-        if expects_table:
-            # The SQL-backed index returns a bounded shortlist, but wide
-            # workbooks can place the numeric cell below many label/note
-            # cells. Keep a larger wrapper-level candidate window, then apply
-            # the task's explicit semantic constraints and numeric validation.
-            search = getattr(self.index, "hybrid_search", None)
-            hits = (
-                search(query, search_type, max(self.top_k, 128), filters or None)
-                if callable(search)
-                else self.index.search_tables(query, max(self.top_k, 128), filters or None)
+        precise = getattr(task, "search_mode", "precise") != "broad"
+
+        # Source resolution is intentionally independent from semantic
+        # precision.  A broad retry may relax row/indicator constraints, but it
+        # should not forget that the user asked about a specific regulation or
+        # workbook.  When many physical files belong to one logical title, the
+        # resolver routes the task to the most relevant concrete files.
+        source_filters, source_diagnostics = self._resolve_source_filters(task)
+        filters = dict(source_filters)
+        if precise and task.source_scope.document_type:
+            filters["document_type"] = [task.source_scope.document_type]
+
+        retrieval_mode = _task_retrieval_mode(task, source_diagnostics)
+
+        if retrieval_mode == "table":
+            raw_hits = _search_table_only(
+                self.index,
+                query,
+                max(self.top_k, 128),
+                filters or None,
+                task=task,
             )
-            hits = [hit for hit in hits if _matches_semantic_constraints(hit, task, self.index)]
-            return _table_result(task, hits, self.index)
-        search = getattr(self.index, "hybrid_search", None)
-        hits = (
-            search(query, search_type, self.top_k, filters or None)
-            if callable(search)
-            else self.index.search_text(query, self.top_k, filters or None)
+            hits = list(raw_hits)
+            if precise:
+                hits = [hit for hit in hits if _matches_semantic_constraints(hit, task, self.index)]
+            hits = [hit for hit in hits if not _hit_matches_excluded_row(hit, task)]
+            execution = _table_result(task, hits, self.index)
+            return RetrievalExecution(
+                execution.result,
+                execution.hits,
+                {
+                    "search_mode": "precise" if precise else "broad",
+                    "search_type": "table_lookup",
+                    "retrieval_mode": retrieval_mode,
+                    "raw_hit_count": len(raw_hits),
+                    "post_constraint_hit_count": len(hits),
+                    "filters": filters,
+                    "selection": getattr(task, "selection", "single"),
+                    "exclude_row_labels": list(getattr(task, "exclude_row_labels", []) or []),
+                    "source_resolution": source_diagnostics,
+                },
+            )
+
+        if retrieval_mode == "text":
+            raw_hits = _search_text_only(
+                self.index,
+                query,
+                max(self.top_k, 24),
+                filters or None,
+            )
+            hits = list(raw_hits)
+            if precise:
+                hits = [hit for hit in hits if _matches_semantic_constraints(hit, task, self.index)]
+            hits = _expand_structural_text_neighbours(hits, self.index)
+            execution = _text_result(task, hits, self.index)
+            return RetrievalExecution(
+                execution.result,
+                execution.hits,
+                {
+                    "search_mode": "precise" if precise else "broad",
+                    "search_type": "regulatory_fact",
+                    "retrieval_mode": retrieval_mode,
+                    "raw_hit_count": len(raw_hits),
+                    "post_constraint_hit_count": len(hits),
+                    "filters": filters,
+                    "source_resolution": source_diagnostics,
+                },
+            )
+
+        # Unknown/mixed source modality: search both arms and let each parser
+        # handle its native evidence type. A numeric answer is not proof that
+        # the source is a table; Word/PDF paragraphs often contain percentages,
+        # amounts and dates.
+        text_raw = _search_text_only(
+            self.index,
+            query,
+            max(self.top_k, 24),
+            filters or None,
         )
-        hits = [hit for hit in hits if _matches_semantic_constraints(hit, task, self.index)]
-        hits = _expand_structural_text_neighbours(hits, self.index)
-        return _text_result(task, hits, self.index)
+        table_raw = _search_table_only(
+            self.index,
+            query,
+            max(self.top_k, 64),
+            filters or None,
+            task=task,
+        )
+
+        text_hits = list(text_raw)
+        table_hits = list(table_raw)
+        if precise:
+            text_hits = [
+                hit for hit in text_hits
+                if _matches_semantic_constraints(hit, task, self.index)
+            ]
+            table_hits = [
+                hit for hit in table_hits
+                if _matches_semantic_constraints(hit, task, self.index)
+            ]
+        table_hits = [
+            hit for hit in table_hits
+            if not _hit_matches_excluded_row(hit, task)
+        ]
+        text_hits = _expand_structural_text_neighbours(text_hits, self.index)
+
+        text_execution = _text_result(task, text_hits, self.index)
+        table_execution = _table_result(task, table_hits, self.index)
+        execution = _choose_mixed_execution(
+            task,
+            text_execution,
+            table_execution,
+        )
+        return RetrievalExecution(
+            execution.result,
+            execution.hits,
+            {
+                "search_mode": "precise" if precise else "broad",
+                "search_type": "mixed_text_table",
+                "retrieval_mode": retrieval_mode,
+                "raw_hit_count": len(text_raw) + len(table_raw),
+                "text_hit_count": len(text_hits),
+                "table_hit_count": len(table_hits),
+                "filters": filters,
+                "source_resolution": source_diagnostics,
+            },
+        )
+
+
+    def _resolve_source_filters(
+        self,
+        task: RetrievalTask,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        requested = normalize_text(task.source_scope.document_title)
+        if not requested:
+            return {}, {
+                "mode": "unscoped",
+                "requested_title": None,
+                "family_candidate_count": 0,
+                "selected_documents": [],
+            }
+
+        documents = _index_documents(self.index)
+        family = [
+            document
+            for document in documents
+            if _document_belongs_to_requested_family(document, requested)
+        ]
+        if not family:
+            # Preserve the legacy title constraint when corpus metadata cannot
+            # resolve the title.  The index may have its own alias handling.
+            return {"title": [requested]}, {
+                "mode": "title_fallback",
+                "requested_title": requested,
+                "family_candidate_count": 0,
+                "selected_documents": [],
+            }
+
+        query_text = _document_routing_query(task)
+        selected = self._rank_document_family(family, requested, query_text)
+
+        file_names = [
+            normalize_text(document.get("file_name"))
+            for document in selected
+            if normalize_text(document.get("file_name"))
+        ]
+        doc_ids = [
+            str(document.get("doc_id") or document.get("id") or "")
+            for document in selected
+            if str(document.get("doc_id") or document.get("id") or "")
+        ]
+
+        if file_names:
+            filters = {"file_name": list(dict.fromkeys(file_names))}
+            mode = "document_family_file_route"
+        else:
+            # Some fixtures only expose titles. Keep every selected title
+            # instead of collapsing duplicate logical titles to one document.
+            titles = [
+                normalize_text(document.get("title"))
+                for document in selected
+                if normalize_text(document.get("title"))
+            ]
+            filters = {"title": list(dict.fromkeys(titles or [requested]))}
+            mode = "document_family_title_route"
+
+        return filters, {
+            "mode": mode,
+            "requested_title": requested,
+            "family_candidate_count": len(family),
+            "selected_document_count": len(selected),
+            "selected_documents": [
+                {
+                    "doc_id": str(document.get("doc_id") or document.get("id") or ""),
+                    "title": normalize_text(document.get("title")),
+                    "file_name": normalize_text(document.get("file_name")),
+                    "document_type": normalize_text(document.get("document_type")),
+                    "route_score": round(float(document.get("_route_score") or 0.0), 6),
+                }
+                for document in selected
+            ],
+            "selected_doc_ids": doc_ids,
+        }
+
+    def _rank_document_family(
+        self,
+        family: list[dict[str, Any]],
+        requested_title: str,
+        query_text: str,
+        *,
+        max_documents: int = 6,
+    ) -> list[dict[str, Any]]:
+        profiles = self._document_route_profiles()
+        ranked: list[dict[str, Any]] = []
+        best_content_score = 0.0
+
+        for document in family:
+            doc_id = str(document.get("doc_id") or document.get("id") or "")
+            title = normalize_text(document.get("title"))
+            file_name = normalize_text(document.get("file_name"))
+            route_score = _document_title_route_score(requested_title, title, file_name)
+            route_score += 4.0 * _routing_text_score(query_text, file_name)
+
+            paragraph_scores = sorted(
+                (
+                    _routing_text_score(query_text, text)
+                    for text in profiles.get(doc_id, [])
+                    if text
+                ),
+                reverse=True,
+            )
+            content_score = paragraph_scores[0] if paragraph_scores else 0.0
+            second_score = paragraph_scores[1] if len(paragraph_scores) > 1 else 0.0
+            best_content_score = max(best_content_score, content_score)
+
+            # Content relevance dominates the final routing.  Title/family
+            # similarity only keeps the search inside the correct logical
+            # regulation.  This is what disambiguates dozens of attachments
+            # sharing the same base title.
+            score = route_score + 8.0 * content_score + 2.0 * second_score
+            enriched = dict(document)
+            enriched["_route_score"] = score
+            enriched["_content_route_score"] = content_score
+            ranked.append(enriched)
+
+        ranked.sort(
+            key=lambda item: (
+                float(item.get("_route_score") or 0.0),
+                normalize_text(item.get("file_name")),
+            ),
+            reverse=True,
+        )
+
+        if len(ranked) <= max_documents:
+            return ranked
+
+        # If lexical routing is confident, keep a small set so similarly named
+        # attachments cannot crowd out the correct file during chunk retrieval.
+        # If no document contains meaningful query terms, retain a wider family
+        # window rather than making a brittle early choice.
+        limit = max_documents if best_content_score >= 0.10 else min(12, len(ranked))
+        cutoff = float(ranked[min(limit - 1, len(ranked) - 1)].get("_route_score") or 0.0)
+        selected = ranked[:limit]
+
+        # Keep near-ties at the boundary (bounded) so a split heading/body pair
+        # in two related files is not accidentally discarded.
+        boundary = float(selected[-1].get("_route_score") or 0.0) if selected else 0.0
+        for item in ranked[limit:]:
+            if len(selected) >= min(12, len(ranked)):
+                break
+            if boundary and float(item.get("_route_score") or 0.0) >= boundary * 0.97:
+                selected.append(item)
+            else:
+                break
+        return selected
+
+    def _document_route_profiles(self) -> dict[str, list[str]]:
+        if self._document_route_profile_cache is not None:
+            return self._document_route_profile_cache
+
+        profiles: dict[str, list[str]] = {}
+        for item in list(getattr(self.index, "text", []) or []):
+            doc_id = str(item.get("doc_id") or "")
+            if not doc_id:
+                continue
+            text = normalize_text(" ".join(str(item.get(key) or "") for key in (
+                "content",
+                "context",
+                "context_window",
+                "_section_scope",
+                "section_title",
+                "heading",
+            )))
+            if text:
+                profiles.setdefault(doc_id, []).append(text)
+
+        # Keep each document profile bounded.  Route scoring uses the best few
+        # matching chunks, so storing thousands of near-duplicate paragraphs is
+        # unnecessary.
+        for doc_id, values in list(profiles.items()):
+            profiles[doc_id] = values[:800]
+
+        self._document_route_profile_cache = profiles
+        return profiles
+
+
+def _task_retrieval_mode(
+    task: RetrievalTask,
+    source_diagnostics: dict[str, Any],
+) -> str:
+    """Choose evidence modality independently from answer value type.
+
+    A requested value can be numeric while the authoritative evidence is a
+    sentence in Word/PDF. Only explicit table structure or a resolved
+    spreadsheet source should force table retrieval.
+    """
+    semantic = task.semantic_constraints
+
+    if task.expected_value_type == "table_cell":
+        return "table"
+    if semantic.row_label or semantic.column_label:
+        return "table"
+
+    selected = list(source_diagnostics.get("selected_documents") or [])
+    if selected:
+        modes = {
+            _document_modality(
+                item.get("document_type"),
+                item.get("file_name"),
+                item.get("title"),
+            )
+            for item in selected
+        }
+        modes.discard("unknown")
+        if modes == {"table"}:
+            return "table"
+        if modes == {"text"}:
+            return "text"
+        if len(modes) > 1:
+            return "mixed"
+
+    # A plain numeric fact, percentage, threshold or amount is not a table
+    # signal. Keep both retrieval arms available when source modality is
+    # unresolved.
+    if task.expected_value_type == "number":
+        return "mixed"
+
+    # Structured statistical dimensions strongly suggest a table; an indicator
+    # by itself does not, because regulations also contain named ratios.
+    if semantic.period and (semantic.indicator or semantic.statistical_scope):
+        return "mixed"
+    return "text"
+
+
+def _document_modality(
+    document_type: Any,
+    file_name: Any,
+    title: Any,
+) -> str:
+    blob = normalize_text(" ".join(str(value or "") for value in [
+        document_type,
+        file_name,
+        title,
+    ])).lower()
+
+    if any(token in blob for token in (
+        ".xlsx", ".xls", ".csv", "spreadsheet", "excel", "工作簿",
+    )):
+        return "table"
+    if any(token in blob for token in (
+        ".doc", ".docx", ".pdf", ".txt", "word", "pdf", "文本",
+    )):
+        return "text"
+    return "unknown"
+
+
+def _search_text_only(
+    index: Any,
+    query: str,
+    top_k: int,
+    filters: dict[str, Any] | None,
+) -> list[Hit]:
+    search = getattr(index, "search_text", None)
+    if callable(search):
+        return list(search(query, top_k, filters))
+
+    # Compatibility with test doubles that only implement hybrid_search.
+    hybrid = getattr(index, "hybrid_search", None)
+    if callable(hybrid):
+        return [
+            hit
+            for hit in hybrid(query, "regulatory_fact", top_k, filters)
+            if getattr(hit, "kind", None) == "text"
+        ]
+    return []
+
+
+def _search_table_only(
+    index: Any,
+    query: str,
+    top_k: int,
+    filters: dict[str, Any] | None,
+    *,
+    task: RetrievalTask | None = None,
+) -> list[Hit]:
+    """Use the planner's structured task instead of re-parsing the query."""
+    search = getattr(index, "search_tables", None)
+    if callable(search):
+        structured = _table_structured_hints(task) if task is not None else None
+        try:
+            return list(search(query, top_k, filters, structured=structured))
+        except TypeError:
+            return list(search(query, top_k, filters))
+
+    hybrid = getattr(index, "hybrid_search", None)
+    if callable(hybrid):
+        return [
+            hit for hit in hybrid(query, "table_lookup", top_k, filters)
+            if getattr(hit, "kind", None) == "table"
+        ]
+    return []
+
+
+def _table_structured_hints(task: RetrievalTask) -> dict[str, Any]:
+    source = task.source_scope
+    semantic = task.semantic_constraints
+    return {
+        "indicator": normalize_text(semantic.indicator) or None,
+        "parent_indicator": normalize_text(semantic.parent_indicator) or None,
+        "institution": normalize_text(semantic.institution) or None,
+        "region": normalize_text(semantic.region) or None,
+        "period": normalize_text(semantic.period) or None,
+        "statistical_scope": normalize_text(semantic.statistical_scope) or None,
+        "row_label": normalize_text(semantic.row_label) or None,
+        "column_label": normalize_text(semantic.column_label) or None,
+        "year": source.year,
+        "month": source.month,
+        "quarter": source.quarter,
+    }
+
+
+def _choose_mixed_execution(
+    task: RetrievalTask,
+    text_execution: RetrievalExecution,
+    table_execution: RetrievalExecution,
+) -> RetrievalExecution:
+    text_ok = text_execution.result.status == "resolved"
+    table_ok = table_execution.result.status == "resolved"
+
+    if text_ok and not table_ok:
+        return text_execution
+    if table_ok and not text_ok:
+        return table_execution
+    if not text_ok and not table_ok:
+        # Prefer an ambiguity result over a pure miss because it gives the Agent
+        # a useful observation to refine.
+        if table_execution.result.status == "ambiguous":
+            return table_execution
+        return text_execution
+
+    # Both arms found evidence. Explicit statistical/table structure wins;
+    # otherwise compare the selected evidence scores.
+    semantic = task.semantic_constraints
+    if task.expected_value_type == "table_cell" or semantic.row_label or semantic.column_label:
+        return table_execution
+
+    text_score = (
+        float(text_execution.result.selected.score)
+        if text_execution.result.selected is not None else 0.0
+    )
+    table_score = (
+        float(table_execution.result.selected.score)
+        if table_execution.result.selected is not None else 0.0
+    )
+    return table_execution if table_score > text_score * 1.15 else text_execution
+
+
 
 
 def _normalized_task(task: RetrievalTask) -> RetrievalTask:
@@ -112,6 +571,135 @@ def _task_query(task: RetrievalTask) -> str:
     return " ".join(str(value) for value in anchors if value)
 
 
+def _index_documents(index: Any) -> list[dict[str, Any]]:
+    documents = list(getattr(index, "documents", []) or [])
+    if documents:
+        return [dict(item) for item in documents]
+    return [
+        dict(value)
+        for value in dict(getattr(index, "doc_by_id", {}) or {}).values()
+    ]
+
+
+def _document_routing_query(task: RetrievalTask) -> str:
+    constraints = task.semantic_constraints
+    return normalize_text(" ".join(str(value or "") for value in [
+        task.query,
+        task.expected_information,
+        constraints.indicator,
+        constraints.parent_indicator,
+        constraints.institution,
+        constraints.region,
+        constraints.period,
+        constraints.statistical_scope,
+        constraints.row_label,
+        constraints.column_label,
+    ]))
+
+
+def _document_belongs_to_requested_family(
+    document: dict[str, Any],
+    requested_title: str,
+) -> bool:
+    requested = _document_family_text(requested_title)
+    if not requested:
+        return False
+    title = _document_family_text(document.get("title"))
+    file_name = _document_family_text(document.get("file_name"))
+    return any(
+        requested in candidate or candidate in requested
+        for candidate in (title, file_name)
+        if candidate
+    )
+
+
+def _document_title_route_score(
+    requested_title: str,
+    title: str,
+    file_name: str,
+) -> float:
+    requested = _document_family_text(requested_title)
+    title_key = _document_family_text(title)
+    file_key = _document_family_text(file_name)
+
+    score = 0.0
+    if title_key == requested:
+        score += 3.0
+    elif requested and requested in title_key:
+        score += 1.6
+    if file_key == requested:
+        score += 2.5
+    elif requested and requested in file_key:
+        score += 1.4
+
+    # “附件” is only a soft penalty when the user cites the parent regulation.
+    # It must never be a hard exclusion because the requested fact may genuinely
+    # live in an attachment.
+    requested_mentions_attachment = "附件" in normalize_text(requested_title)
+    candidate_mentions_attachment = "附件" in normalize_text(f"{title} {file_name}")
+    if candidate_mentions_attachment and not requested_mentions_attachment:
+        score -= 0.15
+    return score
+
+
+def _document_family_text(value: Any) -> str:
+    text = normalize_text(value)
+    text = re.sub(r"\.(?:docx?|pdf|xlsx?|xls|csv|txt)$", "", text, flags=re.I)
+    text = re.sub(r"^\s*\d+\s*[_\-—–.．、 ]+", "", text)
+    text = text.replace("《", "").replace("》", "")
+    return re.sub(r"[\s_：:，,。；;（）()【】\[\]\-—–]+", "", text)
+
+
+def _routing_text_score(query: str, text: str) -> float:
+    query_key = _routing_key(query)
+    text_key = _routing_key(text)
+    if not query_key or not text_key:
+        return 0.0
+    if query_key in text_key:
+        return 1.0
+
+    query_bigrams = {
+        query_key[index:index + 2]
+        for index in range(max(0, len(query_key) - 1))
+    }
+    text_bigrams = {
+        text_key[index:index + 2]
+        for index in range(max(0, len(text_key) - 1))
+    }
+    if not query_bigrams:
+        return 0.0
+
+    coverage = len(query_bigrams & text_bigrams) / len(query_bigrams)
+
+    # Reward distinctive longer phrases from the query.  This helps route
+    # “核心一级资本充足率阈值” to the right physical file even when dozens of
+    # attachments repeat the same regulation title.
+    phrases = [
+        phrase
+        for phrase in re.findall(r"[\u4e00-\u9fffA-Za-z0-9%％]{4,}", normalize_text(query))
+        if len(phrase) >= 4
+    ]
+    phrase_bonus = max(
+        (min(1.0, len(_routing_key(phrase)) / 18) for phrase in phrases if _routing_key(phrase) in text_key),
+        default=0.0,
+    )
+    return min(1.0, 0.82 * coverage + 0.18 * phrase_bonus)
+
+
+def _routing_key(value: Any) -> str:
+    text = normalize_text(value)
+    # Remove common request scaffolding that does not distinguish one attachment
+    # from another.
+    for token in (
+        "根据", "综合", "分别说明", "请说明", "是多少", "哪些", "对应的",
+        "中的", "中", "附件", "工作表", "口径", "数值",
+    ):
+        text = text.replace(token, "")
+    return re.sub(r"[\s《》“”\"'：:，,。；;（）()【】\[\]\-—–]+", "", text)
+
+
+
+
 def _task_filters(task: RetrievalTask) -> dict[str, Any]:
     filters: dict[str, Any] = {}
     if task.source_scope.document_title:
@@ -127,6 +715,7 @@ def _matches_semantic_constraints(hit: Hit, task: RetrievalTask, index: Any) -> 
     source = _document_for_hit(hit, index)
     blob = normalize_text(" ".join(str(value or "") for value in [
         item.get("indicator"), item.get("row_header"), item.get("column_header"), item.get("period"),
+        item.get("_inferred_period"),
         item.get("context"), item.get("content"), item.get("_section_scope"),
         source.get("title"), source.get("file_name"),
     ]))
@@ -176,6 +765,30 @@ def _matches_semantic_constraints(hit: Hit, task: RetrievalTask, index: Any) -> 
     return True
 
 
+
+def _hit_matches_excluded_row(hit: Hit, task: RetrievalTask) -> bool:
+    """Apply negative row constraints after retrieval and before max/min selection."""
+    excluded = {
+        _normalized_row_identity(value)
+        for value in (getattr(task, "exclude_row_labels", []) or [])
+        if normalize_text(value)
+    }
+    if not excluded:
+        return False
+
+    item = hit.item
+    candidate_labels = {
+        _normalized_row_identity(item.get("row_header")),
+        _normalized_row_identity(item.get("indicator")),
+    }
+    candidate_labels.discard("")
+    return bool(excluded.intersection(candidate_labels))
+
+
+def _normalized_row_identity(value: Any) -> str:
+    return canonical_table_label(value).replace(" ", "").replace("　", "")
+
+
 def _institution_matches(requested: str, blob: str) -> bool:
     normalized = normalize_text(requested)
     if normalized in blob:
@@ -220,18 +833,41 @@ def _scope_period(task: RetrievalTask) -> str | None:
 
 
 def _period_matches(requested: str, blob: str) -> bool:
+    """Allow year and quarter to live in different metadata fields."""
     value = normalize_text(requested)
-    variants = {value}
-    month = re.fullmatch(r"(20\d{2})[-年/]0?(\d{1,2})(?:月)?", value)
+    haystack = normalize_text(blob)
+    if not value:
+        return True
+    if value in haystack:
+        return True
+
+    year_match = re.search(r"(20\d{2})", value)
+    year = year_match.group(1) if year_match else None
+
+    quarter_no = None
+    q_match = re.search(r"Q([1-4])", value, re.IGNORECASE)
+    if q_match:
+        quarter_no = int(q_match.group(1))
+    else:
+        cn = re.search(r"(?:第)?([一二三四1-4])季度", value)
+        if cn:
+            raw = cn.group(1)
+            quarter_no = int(raw) if raw.isdigit() else {"一":1,"二":2,"三":3,"四":4}[raw]
+    if quarter_no is not None:
+        chinese = ("一","二","三","四")[quarter_no-1]
+        quarter_ok = any(v in haystack for v in (
+            f"Q{quarter_no}", f"{quarter_no}季度", f"第{quarter_no}季度",
+            f"{chinese}季度", f"第{chinese}季度",
+        ))
+        return (not year or year in haystack) and quarter_ok
+
+    month = re.search(r"(?:20\d{2}[-年/]?)?0?([1-9]|1[0-2])月", value)
     if month:
-        year, number = month.groups()
-        variants.update({f"{year}-{int(number):02d}", f"{year}年{int(number)}月"})
-    quarter = re.fullmatch(r"(20\d{2})-?Q([1-4])", value, re.IGNORECASE)
-    if quarter:
-        year, number = quarter.groups()
-        chinese = ("一", "二", "三", "四")[int(number) - 1]
-        variants.update({f"{year}-Q{number}", f"{year}年第{chinese}季度", f"{year}年{chinese}季度"})
-    return any(variant in blob for variant in variants)
+        m=int(month.group(1))
+        month_ok=any(v in haystack for v in (f"{m}月",f"{m:02d}月",f"-{m:02d}"))
+        return (not year or year in haystack) and month_ok
+
+    return not year or year in haystack
 
 
 def _table_result(task: RetrievalTask, hits: list[Hit], index: Any) -> RetrievalExecution:
@@ -254,7 +890,9 @@ def _table_result(task: RetrievalTask, hits: list[Hit], index: Any) -> Retrieval
             indicator=normalize_text(hit.item.get("indicator")) or None,
             row_label=normalize_text(hit.item.get("row_header")) or None,
             column_label=normalize_text(hit.item.get("column_header")) or None,
-            period=normalize_text(hit.item.get("period")) or None,
+            period=normalize_text(
+                hit.item.get("period") or hit.item.get("_inferred_period")
+            ) or None,
             content=normalize_text(hit.item.get("context")) or None,
             score=float(max(hit.table_score, hit.fused_score, hit.rerank_score)),
         )
@@ -267,6 +905,42 @@ def _table_result(task: RetrievalTask, hits: list[Hit], index: Any) -> Retrieval
             status="not_found",
             expected_information=task.expected_information,
         ), [])
+
+    selection = getattr(task, "selection", "single")
+    if selection in {"max", "min"}:
+        selected_pair = _select_extreme_candidate(candidates, candidate_hits, selection)
+        if selected_pair is None:
+            return RetrievalExecution(RetrievalResult(
+                task_id=task.id,
+                status="not_found",
+                expected_information=task.expected_information,
+                candidates=candidates,
+                evidence_ids=[item for candidate in candidates for item in candidate.evidence_ids],
+                ambiguity_reason="候选集合中没有可比较的数值",
+            ), candidate_hits)
+        selected, selected_hit = selected_pair
+        # Keep the comparison set as evidence, but place the deterministic
+        # argmax/argmin candidate in ``selected`` so the Answer Agent can state
+        # both the winning item and its value without performing arithmetic.
+        return RetrievalExecution(RetrievalResult(
+            task_id=task.id,
+            status="resolved",
+            expected_information=task.expected_information,
+            selected=selected,
+            candidates=candidates,
+            evidence_ids=selected.evidence_ids,
+        ), [selected_hit, *[hit for hit in candidate_hits if hit.evidence_id != selected_hit.evidence_id]])
+
+    if selection == "all":
+        selected = candidates[0]
+        return RetrievalExecution(RetrievalResult(
+            task_id=task.id,
+            status="resolved",
+            expected_information=task.expected_information,
+            selected=selected,
+            candidates=candidates,
+            evidence_ids=[item for candidate in candidates for item in candidate.evidence_ids],
+        ), candidate_hits)
 
     ambiguity = _ambiguity_reason(task, candidates)
     if ambiguity:
@@ -287,6 +961,41 @@ def _table_result(task: RetrievalTask, hits: list[Hit], index: Any) -> Retrieval
         candidates=candidates,
         evidence_ids=selected.evidence_ids,
     ), candidate_hits)
+
+
+
+def _select_extreme_candidate(
+    candidates: list[RetrievalCandidate],
+    hits: list[Hit],
+    selection: str,
+) -> tuple[RetrievalCandidate, Hit] | None:
+    """Deterministically select argmax/argmin from one retrieved table slice."""
+    numeric: list[tuple[Decimal, RetrievalCandidate, Hit]] = []
+    for candidate, hit in zip(candidates, hits):
+        value = _numeric_decimal(candidate.value)
+        if value is not None:
+            numeric.append((value, candidate, hit))
+    if not numeric:
+        return None
+    chooser = max if selection == "max" else min
+    _, candidate, hit = chooser(numeric, key=lambda item: item[0])
+    return candidate, hit
+
+
+def _numeric_decimal(value: Any) -> Decimal | None:
+    if value is None or isinstance(value, bool):
+        return None
+    text = normalize_text(value).replace(",", "")
+    percentage = text.endswith(("%", "％"))
+    text = text.rstrip("%％")
+    if not re.fullmatch(r"[-+]?\d+(?:\.\d+)?", text):
+        return None
+    try:
+        number = Decimal(text)
+    except InvalidOperation:
+        return None
+    return number / Decimal("100") if percentage else number
+
 
 
 def _text_result(task: RetrievalTask, hits: list[Hit], index: Any) -> RetrievalExecution:

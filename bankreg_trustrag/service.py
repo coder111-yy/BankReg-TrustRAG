@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import threading
 import time
 import uuid
 import re
@@ -27,9 +29,17 @@ from .utils import char_ngrams, normalize_text
 from .verification import trust_decision, verify_claims
 
 
+logger = logging.getLogger("bankreg_trustrag.service")
+
+
 class TrustRAGService:
     def __init__(self, settings: Settings, store: Store | None = None):
         self.settings = settings
+        # The BGE pipeline, planner clients and runtime usage state are shared
+        # by the service instance. Serialize QA execution so an abandoned
+        # SSE request cannot keep running in a worker thread while a new
+        # request enters the same model/index objects.
+        self._ask_lock = threading.RLock()
         self.store = store or Store(settings.db_path)
         self.generator = GroundedGenerator.from_settings(settings)
         if self.store.document_count() == 0 and (settings.artifact_dir / "documents.jsonl").exists():
@@ -52,9 +62,25 @@ class TrustRAGService:
         self._refresh_agentic_executor()
 
     def reload(self) -> None:
-        self.store.load_jsonl(self.settings.artifact_dir)
-        self.index = HybridIndex.from_store(self.store, semantic=self.semantic, vector_dir=self.settings.bge_vector_dir)
-        self._refresh_agentic_executor()
+        with self._ask_lock:
+            self.store.load_jsonl(self.settings.artifact_dir)
+            self.index = HybridIndex.from_store(
+                self.store,
+                semantic=self.semantic,
+                vector_dir=self.settings.bge_vector_dir,
+            )
+            self._refresh_agentic_executor()
+
+    def recover_runtime(self) -> None:
+        """Reset transient agent/LLM state without rebuilding the corpus.
+
+        A failed HTTP/model client should not require restarting Uvicorn.
+        The index and database remain intact; only short-lived agent clients are
+        recreated.  Text-vector initialization can retry on its own after the
+        earlier _text_vectors_ready fix.
+        """
+        with self._ask_lock:
+            self._refresh_agentic_executor()
 
     def _refresh_agentic_executor(self) -> None:
         answer_client = LLMClient.from_settings(self.settings)
@@ -65,9 +91,76 @@ class TrustRAGService:
             AnswerGenerator.from_settings(self.settings, answer_client),
             CompletenessChecker(),
             max_answer_attempts=int(getattr(self.settings, "agentic_max_answer_attempts", 2)),
+            max_steps=int(getattr(self.settings, "agentic_max_steps", 8)),
         )
 
     def ask(
+        self,
+        question: str,
+        choices: list[str] | None = None,
+        qa_type: str | None = None,
+        filters: dict[str, Any] | None = None,
+        conversation_context: list[dict[str, Any]] | None = None,
+        observer: Callable[[str, dict[str, Any]], None] | None = None,
+    ) -> QAResponse:
+        """Run one QA request with process-local serialization and recovery.
+
+        StreamingResponse cancellation cannot terminate an already-running
+        asyncio.to_thread worker.  Serializing here prevents those orphaned
+        workers from concurrently using the shared BGE/LLM runtime.
+        """
+        acquired = self._ask_lock.acquire(blocking=False)
+        if not acquired:
+            if observer is not None:
+                observer(
+                    "runtime_queue",
+                    {
+                        "elapsed_ms": 0,
+                        "label": "已有请求仍在执行，当前请求正在等待运行时资源",
+                    },
+                )
+            self._ask_lock.acquire()
+
+        try:
+            try:
+                return self._ask_once(
+                    question,
+                    choices,
+                    qa_type,
+                    filters,
+                    conversation_context,
+                    observer,
+                )
+            except Exception as exc:
+                if not _is_retryable_runtime_error(exc):
+                    raise
+
+                logger.exception("transient QA runtime failure; retrying once")
+                if observer is not None:
+                    observer(
+                        "runtime_recovery",
+                        {
+                            "elapsed_ms": 0,
+                            "label": "检测到临时运行异常，正在自动重置并重试一次",
+                        },
+                    )
+
+                # Recreate planner/answer LLM clients.  Do not rebuild the
+                # database or corpus and do not alter retrieval semantics.
+                self._refresh_agentic_executor()
+
+                return self._ask_once(
+                    question,
+                    choices,
+                    qa_type,
+                    filters,
+                    conversation_context,
+                    observer,
+                )
+        finally:
+            self._ask_lock.release()
+
+    def _ask_once(
         self,
         question: str,
         choices: list[str] | None = None,
@@ -148,11 +241,16 @@ class TrustRAGService:
         if state.clarification is not None:
             answer = _agentic_clarification_answer(state)
             claims: list[str] = []
+        elif getattr(state, "refusal_reason", None):
+            answer = "当前资料中未检索到足以支持结论的证据，无法可靠回答。"
+            claims = []
         elif state.execution_error is not None:
-            answer = "系统已取得相关证据，但内部结果绑定未完成，请稍后重试。"
+            # Internal runtime failures are not evidence refusals and must never
+            # be presented as an output-binding/domain conclusion.
+            answer = "本次请求执行异常，请稍后重试。"
             claims = []
         else:
-            answer = state.final_answer or "当前工具结果不足，无法可靠回答。"
+            answer = state.final_answer or "当前资料中未检索到足以支持结论的证据，无法可靠回答。"
             claims = split_grounded_claims(answer)
 
         verification_started = time.perf_counter()
@@ -194,7 +292,12 @@ class TrustRAGService:
                 state.latency.get("generation_ms", 0)
                 + int((time.perf_counter() - repair_started) * 1000)
             )
-            repaired_completeness = executor.completeness_checker.check_answer(plan, repaired.generated)
+            repaired_completeness = executor.completeness_checker.check_answer(
+                plan,
+                repaired.generated,
+                available_refs=set(state.retrieval_results) | set(state.calculation_results),
+                strict_required_outputs=False,
+            )
             if repaired_completeness.complete:
                 repaired_answer = repaired.generated.answer
                 repaired_claims = split_grounded_claims(repaired_answer)
@@ -222,10 +325,15 @@ class TrustRAGService:
             trust["decision"] = "clarify"
             trust["score"] = min(float(trust.get("score", 0.0)), 0.45)
             trust.setdefault("reasons", []).append(str(state.clarification.get("reason") or "需要补充信息"))
-        elif state.execution_error is not None:
+        elif getattr(state, "refusal_reason", None):
             trust["decision"] = "refuse"
             trust["score"] = min(float(trust.get("score", 0.0)), 0.2)
-            trust.setdefault("reasons", []).append("内部执行结果绑定失败")
+            trust.setdefault("reasons", []).append(str(state.refusal_reason))
+        elif state.execution_error is not None:
+            # Runtime failure is kept distinct from an evidence-based refusal.
+            trust["decision"] = "clarify"
+            trust["score"] = min(float(trust.get("score", 0.0)), 0.1)
+            trust.setdefault("reasons", []).append("本次智能体执行异常，可重试")
         elif not verification.passed:
             trust["decision"] = "clarify"
             trust.setdefault("reasons", []).append("Agentic回答未通过事实核验")
@@ -270,7 +378,7 @@ class TrustRAGService:
             "operations": operations,
             "execution_trace": trace,
             "agent_workflow": {
-                "mode": "explicit_bounded_state_machine",
+                "mode": "adaptive_plan_act_observe_replan",
                 "answer_generation": {
                     "strategy": "llm_grounded" if state.answer_outcome and state.answer_outcome.status == "ok" else "api_failure_fallback",
                     "status": state.answer_outcome.status if state.answer_outcome else None,
@@ -297,9 +405,13 @@ class TrustRAGService:
                 "查询规划失败，已返回重试提示"
                 if state.planner_status != "ok"
                 else (
-                    "内部执行未完成，请重试"
-                    if state.execution_error is not None
-                    else "回答完整性与证据核验已完成"
+                    "多轮检索后证据仍不足"
+                    if getattr(state, "refusal_reason", None)
+                    else (
+                        "本次智能体执行异常，请重试"
+                        if state.execution_error is not None
+                        else "自适应检索与证据核验已完成"
+                    )
                 )
             )
             observer("completed", {"elapsed_ms": latency, "label": label})
@@ -732,6 +844,53 @@ class TrustRAGService:
         response = QAResponse(answer, parsed.qa_type, [], verification.to_dict(), trust, trace_id, latency, plan)
         self.store.save_qa(trace_id, original_question, parsed.qa_type, plan, [], answer, trust["score"], verification.to_dict(), trust["decision"], latency)
         return response
+
+
+
+def _is_retryable_runtime_error(exc: Exception) -> bool:
+    """Recognize transport/runtime failures that commonly recover after restart."""
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return True
+
+    name = type(exc).__name__.lower()
+    text = str(exc).lower()
+    markers = (
+        "timeout",
+        "timed out",
+        "connection",
+        "network",
+        "transport",
+        "connection reset",
+        "connection refused",
+        "remote protocol",
+        "server disconnected",
+        "client has been closed",
+        "session is closed",
+        "database is locked",
+        "database table is locked",
+        "recursive use of cursors",
+        "temporarily unavailable",
+        "broken pipe",
+        "too many requests",
+        "429",
+        "502",
+        "503",
+        "504",
+    )
+    retryable_names = (
+        "connecterror",
+        "readtimeout",
+        "writetimeout",
+        "pooltimeout",
+        "remoteprotocolerror",
+        "connectionerror",
+        "operationalerror",
+    )
+    return any(marker in text for marker in markers) or any(
+        token in name for token in retryable_names
+    )
+
+
 
 
 def _choice_answer_draft(choice_result: Any) -> AnswerDraft:
@@ -1303,10 +1462,14 @@ def _agentic_display_hits(state: AgentState) -> list[Any]:
 
 
 def _agentic_clarification_answer(state: AgentState) -> str:
-    reason = str((state.clarification or {}).get("reason") or "问题信息不足").rstrip("。；; ")
+    clarification = state.clarification or {}
+    question = str(clarification.get("question") or "").strip()
+    reason = str(clarification.get("reason") or "问题信息不足").rstrip("。；; ")
     if state.planner_status not in {"ok", "not_started"}:
-        return f"查询规划失败，未执行检索或生成答案，请稍后重试。原因：{reason}。"
-    return f"需要补充信息：{reason}。请补充相应的期间、机构或统计口径后再查询。"
+        return "查询规划服务暂时不可用，请稍后重试。"
+    if question:
+        return question
+    return f"当前问题存在无法通过继续检索消除的歧义：{reason}。"
 
 
 def _merge_hits(*groups: list[Any]) -> list[Any]:

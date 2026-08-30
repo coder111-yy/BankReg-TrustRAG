@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import heapq
+import threading
 import math
 import re
 from collections import Counter, defaultdict
@@ -52,6 +53,243 @@ class Hit:
         return result
 
 
+def _table_period_candidates(
+    query: str,
+    structured: dict[str, Any] | None = None,
+) -> list[str]:
+    """Return exact-period variants suitable for SQLite IN predicates."""
+    structured = structured or {}
+    values: list[str] = []
+
+    def add(value: Any) -> None:
+        text = normalize_text(value)
+        if text and text not in values:
+            values.append(text)
+
+    year = structured.get("year")
+    month = structured.get("month")
+    quarter = structured.get("quarter")
+    period = normalize_text(structured.get("period"))
+
+    if period:
+        add(period)
+    if year:
+        add(str(int(year)))
+    if year and month:
+        add(f"{int(year):04d}-{int(month):02d}")
+        add(f"{int(year)}年{int(month)}月")
+    if year and quarter:
+        q = int(quarter)
+        cn = ("一", "二", "三", "四")[q - 1]
+        add(f"{int(year):04d}-Q{q}")
+        add(f"{int(year)}年{cn}季度")
+        add(f"{int(year)}年第{cn}季度")
+        add(f"{cn}季度")
+    elif quarter:
+        q = int(quarter)
+        add(("一季度", "二季度", "三季度", "四季度")[q - 1])
+
+    if not values:
+        text = normalize_text(query)
+        month_match = re.search(r"(20\d{2})年\s*0?(\d{1,2})月", text)
+        if month_match:
+            add(f"{month_match.group(1)}-{int(month_match.group(2)):02d}")
+            add(month_match.group(1))
+        else:
+            _, normalized_period, q_label = reporting_period_details(text)
+            add(normalized_period)
+            add(q_label)
+            year_match = re.search(r"(20\d{2})年", text)
+            if year_match:
+                add(year_match.group(1))
+    return values
+
+
+
+def _structured_year_number(structured: dict[str, Any]) -> int | None:
+    value = structured.get("year")
+    if value:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            pass
+    match = re.search(r"(20\d{2})", normalize_text(structured.get("period")))
+    return int(match.group(1)) if match else None
+
+
+def _structured_quarter_number(structured: dict[str, Any]) -> int | None:
+    value = structured.get("quarter")
+    if value:
+        try:
+            number = int(value)
+            return number if 1 <= number <= 4 else None
+        except (TypeError, ValueError):
+            pass
+    text = normalize_text(structured.get("period"))
+    match = re.search(r"Q([1-4])", text, re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    match = re.search(r"(?:第)?([一二三四1-4])季度", text)
+    if not match:
+        return None
+    raw = match.group(1)
+    return int(raw) if raw.isdigit() else {"一": 1, "二": 2, "三": 3, "四": 4}[raw]
+
+
+def _structured_month_number(structured: dict[str, Any]) -> int | None:
+    value = structured.get("month")
+    if value:
+        try:
+            number = int(value)
+            return number if 1 <= number <= 12 else None
+        except (TypeError, ValueError):
+            pass
+    text = normalize_text(structured.get("period"))
+    match = re.search(r"(?:20\d{2}[-年/]?)?0?([1-9]|1[0-2])月", text)
+    return int(match.group(1)) if match else None
+
+
+def _table_row_number(item: dict[str, Any]) -> int | None:
+    for key in ("row_no", "row_number", "excel_row", "row_index"):
+        value = item.get(key)
+        if value not in (None, ""):
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                pass
+    address = normalize_text(item.get("cell_address"))
+    match = re.search(r"[A-Za-z]+(\d+)", address)
+    return int(match.group(1)) if match else None
+
+
+def _table_sheet_key(item: dict[str, Any]) -> tuple[str, str]:
+    return (
+        str(item.get("doc_id") or ""),
+        normalize_text(item.get("sheet_name") or item.get("table_name")),
+    )
+
+
+def _quarter_from_text(value: Any) -> int | None:
+    text = normalize_text(value)
+    if not text:
+        return None
+    match = re.search(r"Q([1-4])", text, re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    match = re.search(r"(?:第)?([一二三四1-4])季度", text)
+    if not match:
+        return None
+    raw = match.group(1)
+    return int(raw) if raw.isdigit() else {"一": 1, "二": 2, "三": 3, "四": 4}[raw]
+
+
+def _month_from_text(value: Any) -> int | None:
+    text = normalize_text(value)
+    if not text:
+        return None
+    match = re.search(r"(?:20\d{2}[-年/]?)?0?([1-9]|1[0-2])月", text)
+    return int(match.group(1)) if match else None
+
+
+def _build_period_anchors(
+    items: list[dict[str, Any]],
+    *,
+    kind: str,
+) -> dict[tuple[str, str], list[tuple[int, int]]]:
+    """Build sparse period anchors from merged/heading cells in an Excel sheet."""
+    anchors: dict[tuple[str, str], list[tuple[int, int]]] = defaultdict(list)
+    extractor = _quarter_from_text if kind == "quarter" else _month_from_text
+
+    for item in items:
+        row = _table_row_number(item)
+        if row is None:
+            continue
+        text = " ".join(str(item.get(key) or "") for key in (
+            "period",
+            "indicator",
+            "row_header",
+            "column_header",
+            "value_text",
+        ))
+        value = extractor(text)
+        if value is None:
+            continue
+        anchors[_table_sheet_key(item)].append((row, value))
+
+    for key in list(anchors):
+        anchors[key] = sorted(set(anchors[key]))
+    return anchors
+
+
+def _nearest_period_anchor(
+    item: dict[str, Any],
+    anchors: dict[tuple[str, str], list[tuple[int, int]]],
+) -> int | None:
+    row = _table_row_number(item)
+    if row is None:
+        return None
+    values = anchors.get(_table_sheet_key(item), [])
+    preceding = [value for anchor_row, value in values if anchor_row <= row]
+    return preceding[-1] if preceding else None
+
+
+def _structured_item_period_match(
+    item: dict[str, Any],
+    *,
+    requested_year: int | None,
+    requested_quarter: int | None,
+    requested_month: int | None,
+    quarter_anchors: dict[tuple[str, str], list[tuple[int, int]]],
+    month_anchors: dict[tuple[str, str], list[tuple[int, int]]],
+    documents: dict[str, dict[str, Any]],
+) -> tuple[bool, str | None]:
+    """Match period fields, including sparse merged-cell period labels."""
+    direct_text = " ".join(str(item.get(key) or "") for key in (
+        "period",
+        "row_header",
+        "column_header",
+        "context",
+    ))
+    document = documents.get(str(item.get("doc_id") or ""), {})
+    source_text = " ".join(str(document.get(key) or "") for key in (
+        "title", "file_name", "local_path",
+    ))
+
+    if requested_year and str(requested_year) not in normalize_text(
+        f"{direct_text} {source_text}"
+    ):
+        return False, None
+
+    if requested_quarter:
+        direct_quarter = _quarter_from_text(direct_text)
+        actual_quarter = direct_quarter or _nearest_period_anchor(item, quarter_anchors)
+        if actual_quarter != requested_quarter:
+            return False, None
+        chinese = ("一", "二", "三", "四")[requested_quarter - 1]
+        inferred = (
+            f"{requested_year}-Q{requested_quarter}"
+            if requested_year
+            else f"{chinese}季度"
+        )
+        return True, inferred
+
+    if requested_month:
+        direct_month = _month_from_text(direct_text)
+        actual_month = direct_month or _nearest_period_anchor(item, month_anchors)
+        if actual_month != requested_month:
+            return False, None
+        inferred = (
+            f"{requested_year:04d}-{requested_month:02d}"
+            if requested_year
+            else f"{requested_month}月"
+        )
+        return True, inferred
+
+    return True, str(requested_year) if requested_year else None
+
+
+
+
 class HybridIndex:
     """Hybrid lexical/structured index with optional real local BGE retrieval.
 
@@ -72,6 +310,8 @@ class HybridIndex:
         self.documents = list(documents)
         self.text = list(text)
         self.tables = list(tables)
+        self._text_vectors_ready = False
+        self._text_vector_lock = threading.Lock()
         # Production corpora contain more than one million table cells.  Keep
         # the SQLite-backed provider instead of materialising that corpus in
         # Python; small in-memory fixtures continue to use ``tables``.
@@ -84,6 +324,11 @@ class HybridIndex:
             else None
         )
         self._text_vectors_ready = False
+        # Small cache for source-scoped table rows used by deterministic
+        # structured lookup. It is intentionally bounded and only caches
+        # relatively small workbooks.
+        self._structured_table_cache: dict[tuple[str, ...], list[dict[str, Any]]] = {}
+
         self._runtime_usage: dict[str, bool] = {
             "bm25_used": False,
             "metadata_filter_used": False,
@@ -200,11 +445,43 @@ class HybridIndex:
 
     def _ensure_text_vectors(self) -> bool:
         if self._text_vectors_ready:
-            return bool(self._text_vector_index and self._text_vector_index.available)
-        self._text_vectors_ready = True
-        if not self._text_vector_index or not self.semantic or not self.text:
-            return False
-        return self._text_vector_index.build_or_load(self.text, self._text_blob)
+            return bool(
+                self._text_vector_index
+                and self._text_vector_index.available
+            )
+
+        with self._text_vector_lock:
+
+            # 防止另一个线程已经完成初始化
+            if self._text_vectors_ready:
+                return bool(
+                    self._text_vector_index
+                    and self._text_vector_index.available
+                )
+
+            if (
+                    not self._text_vector_index
+                    or not self.semantic
+                    or not self.text
+            ):
+                return False
+
+            try:
+                success = bool(
+                    self._text_vector_index.build_or_load(
+                        self.text,
+                        self._text_blob,
+                    )
+                )
+            except Exception:
+                # 初始化失败不能污染后续请求
+                self._text_vectors_ready = False
+                return False
+
+            # 只有真正成功才标 ready
+            self._text_vectors_ready = success
+
+            return success
 
     @staticmethod
     def _df(rows: list[list[str]]) -> Counter:
@@ -470,28 +747,76 @@ class HybridIndex:
         lexical: bool = True,
         metadata: bool = True,
         fuse: bool = True,
+        structured: dict[str, Any] | None = None,
     ) -> list[Hit]:
+        structured = structured or {}
         if self._table_provider is not None:
-            return self._search_tables_lazy(query, top_k, filters, dense=dense, lexical=lexical, metadata=metadata, fuse=fuse)
+            exact_hits = self._search_tables_structured_exact(
+                query,
+                top_k,
+                filters,
+                structured=structured,
+            )
+            if exact_hits is not None:
+                self._runtime_usage["structured_table_used"] = True
+                if metadata and filters:
+                    self._runtime_usage["metadata_filter_used"] = True
+                return exact_hits
+
+            return self._search_tables_lazy(
+                query,
+                top_k,
+                filters,
+                dense=dense,
+                lexical=lexical,
+                metadata=metadata,
+                fuse=fuse,
+                structured=structured,
+            )
         q_tokens = tokens(query) if lexical else []
         self._runtime_usage["structured_table_used"] = True
         if metadata and filters:
             self._runtime_usage["metadata_filter_used"] = True
         candidate_indices = self._candidate_indices("table", filters)
-        requested_indicator = extract_indicator(query)
+        # Prefer the LLM planner's structured RetrievalTask. Natural-language
+        # parsing remains only as a backward-compatible fallback.
+        parsed_row, parsed_column = extract_dimension_labels(query)
+        requested_indicator = normalize_text(structured.get("indicator")) or extract_indicator(query)
+        requested_row = normalize_text(structured.get("row_label")) or (
+            None if structured else parsed_row
+        )
+        requested_column = normalize_text(structured.get("column_label")) or (
+            None if structured else parsed_column
+        )
+        requested_institution = normalize_text(structured.get("institution")) or None
         normalized_indicator = normalize_text(requested_indicator).lower() if requested_indicator else None
-        requested_row, requested_column = extract_dimension_labels(query)
         normalized_row = _canonical_label(requested_row)
         normalized_column = canonical_dimension_label(requested_column)
-        requested_scope = insurance_company_scope(query)
+        normalized_institution = canonical_dimension_label(requested_institution)
+        requested_scope = (
+            normalize_text(structured.get("statistical_scope"))
+            or insurance_company_scope(query)
+        )
         calculation_columns = _calculation_columns(query)
         is_calculation = len(calculation_columns) >= 2
 
-        # Period is a high-selectivity structured key. Restricting by it before
-        # scoring avoids repeatedly computing similarity over the full million-cell
-        # corpus for ordinary period-specific questions.
-        period_match = re.search(r"(20\d{2})年\s*0?(\d{1,2})月", normalize_text(query))
-        _, requested_document_period, requested_quarter = reporting_period_details(query)
+        # Period can be split across metadata: e.g. year in the document title
+        # and “一季度” in the row/period field. Build it from structured hints
+        # first, then fall back to the query parser.
+        structured_year = structured.get("year")
+        structured_month = structured.get("month")
+        structured_quarter = structured.get("quarter")
+        structured_period = normalize_text(structured.get("period"))
+        period_query = structured_period or normalize_text(query)
+        period_match = re.search(r"(20\d{2})年\s*0?(\d{1,2})月", period_query)
+        _, requested_document_period, requested_quarter = reporting_period_details(period_query)
+        if structured_year and structured_month:
+            requested_document_period = f"{int(structured_year):04d}-{int(structured_month):02d}"
+        elif structured_year and structured_quarter:
+            requested_document_period = f"{int(structured_year):04d}-Q{int(structured_quarter)}"
+            requested_quarter = ("一季度", "二季度", "三季度", "四季度")[int(structured_quarter)-1]
+        elif structured_quarter and not requested_quarter:
+            requested_quarter = ("一季度", "二季度", "三季度", "四季度")[int(structured_quarter)-1]
         if requested_document_period and re.fullmatch(r"20\d{2}-Q[1-4]", requested_document_period):
             # Separate quarterly workbooks often persist only the year in each
             # cell's ``period`` field.  Their document title retains the actual
@@ -620,11 +945,20 @@ class HybridIndex:
                     table_score += 4.0
 
             if requested_quarter:
-                column_context = normalize_text(" ".join(
-                    str(item.get(key) or "") for key in ["column_header", "context"]
+                quarter_context = normalize_text(" ".join(
+                    str(item.get(key) or "")
+                    for key in ["period", "row_header", "column_header", "context"]
                 ))
-                if requested_quarter in column_context:
+                if requested_quarter in quarter_context:
                     table_score += 2.0
+
+            if normalized_institution:
+                dimension_context = canonical_dimension_label(" ".join(
+                    str(item.get(key) or "")
+                    for key in ["row_header", "column_header", "context"]
+                ))
+                if normalized_institution in dimension_context:
+                    table_score += 4.0
 
             # A cheap pre-score is enough to choose the shortlist.  BGE or the
             # model-free character score is applied only after this stage.
@@ -775,12 +1109,173 @@ class HybridIndex:
                 matching.append(str(doc["doc_id"]))
         return matching
 
+
+    def _search_tables_structured_exact(
+        self,
+        query: str,
+        top_k: int,
+        filters: dict[str, Any] | None,
+        *,
+        structured: dict[str, Any] | None = None,
+    ) -> list[Hit] | None:
+        """Resolve a strongly-structured Excel cell without BGE/agent retries.
+
+        The LLM planner has already identified the semantic coordinates.  For a
+        source-scoped workbook task such as:
+            indicator=可疑类贷款余额
+            institution=大型商业银行
+            quarter=1
+        it is wasteful and less reliable to re-rank dozens of cells with BGE.
+
+        This fast path scans only the already-selected physical workbook(s),
+        matches row/column semantics deterministically, and reconstructs sparse
+        quarter/month labels from the nearest preceding header row when Excel
+        merged cells left the target row itself blank.
+
+        Returning ``None`` means "not confident; use the normal hybrid path".
+        Returning a list means the exact path was confident enough to own the
+        result.
+        """
+        if self._table_provider is None:
+            return None
+
+        structured = structured or {}
+        indicator = normalize_text(structured.get("indicator"))
+        row_label = normalize_text(structured.get("row_label"))
+        institution = normalize_text(structured.get("institution"))
+        column_label = normalize_text(structured.get("column_label"))
+        region = normalize_text(structured.get("region"))
+
+        # Strong coordinates only.  Generic/free-text table queries still use
+        # BM25/BGE/RRF.
+        row_target = indicator or row_label
+        dimension_target = column_label or institution or region
+        requested_quarter = _structured_quarter_number(structured)
+        requested_month = _structured_month_number(structured)
+        requested_year = _structured_year_number(structured)
+
+        if not row_target or not dimension_target:
+            return None
+        if not (requested_quarter or requested_month or normalize_text(structured.get("period"))):
+            return None
+
+        doc_ids = self._matching_doc_ids(filters)
+        if not doc_ids or len(doc_ids) > 8:
+            return None
+
+        items = self._structured_source_rows(doc_ids)
+        if not items:
+            return None
+
+        quarter_anchors = _build_period_anchors(items, kind="quarter")
+        month_anchors = _build_period_anchors(items, kind="month")
+
+        normalized_row_target = _canonical_label(row_target)
+        normalized_dimension = canonical_dimension_label(dimension_target)
+        selected: list[Hit] = []
+
+        for raw_item in items:
+            # Table lookup tasks in this fast path are scalar-cell lookups.
+            if normalized_number(raw_item.get("value_text")) is None:
+                continue
+
+            item_indicator = _canonical_label(raw_item.get("indicator"))
+            item_row = _canonical_label(raw_item.get("row_header"))
+            if normalized_row_target not in {item_indicator, item_row}:
+                continue
+
+            dimension_blob = canonical_dimension_label(" ".join(
+                str(raw_item.get(key) or "")
+                for key in ("column_header", "row_header", "context")
+            ))
+            if normalized_dimension not in dimension_blob:
+                continue
+
+            period_match, inferred_period = _structured_item_period_match(
+                raw_item,
+                requested_year=requested_year,
+                requested_quarter=requested_quarter,
+                requested_month=requested_month,
+                quarter_anchors=quarter_anchors,
+                month_anchors=month_anchors,
+                documents=self.doc_by_id,
+            )
+            if not period_match:
+                continue
+
+            item = dict(raw_item)
+            if inferred_period:
+                item["_inferred_period"] = inferred_period
+            item["_structured_exact_match"] = True
+
+            score = 20.0
+            column = canonical_dimension_label(item.get("column_header"))
+            if column and normalized_dimension == column:
+                score += 8.0
+            elif normalized_dimension in dimension_blob:
+                score += 4.0
+
+            if item_indicator == normalized_row_target:
+                score += 5.0
+            if item_row == normalized_row_target:
+                score += 5.0
+
+            selected.append(Hit(
+                "table",
+                item,
+                lexical_score=0.0,
+                dense_score=0.0,
+                metadata_score=self._metadata(item, query, filters) if filters else 0.0,
+                table_score=score,
+            ))
+
+        if not selected:
+            return None
+
+        selected.sort(
+            key=lambda hit: (
+                hit.table_score,
+                hit.metadata_score,
+                hit.evidence_id,
+            ),
+            reverse=True,
+        )
+
+        # If the strongest semantic coordinates still map to many different
+        # values, let RetrievalTools perform its normal ambiguity check rather
+        # than inventing a winner.
+        return selected[:max(top_k, 8)]
+
+    def _structured_source_rows(self, doc_ids: list[str]) -> list[dict[str, Any]]:
+        """Fetch and lightly cache all table rows for a few selected workbooks."""
+        key = tuple(sorted(str(value) for value in doc_ids))
+        cached = self._structured_table_cache.get(key)
+        if cached is not None:
+            return [dict(item) for item in cached]
+
+        rows = [
+            dict(item)
+            for item in self._table_provider(doc_ids=list(key), limit=20000)
+        ]
+        # A 20k result may be truncated, so never cache or exact-resolve from a
+        # potentially incomplete workbook slice.
+        if len(rows) >= 20000:
+            return []
+
+        if len(rows) <= 5000:
+            if len(self._structured_table_cache) >= 4:
+                self._structured_table_cache.clear()
+            self._structured_table_cache[key] = [dict(item) for item in rows]
+        return rows
+
+
     def _lazy_table_candidates(
         self,
         query: str,
         filters: dict[str, Any] | None,
         *,
         formula: bool = False,
+        structured: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         """Fetch a bounded, high-recall candidate set from the SQLite store."""
         if self._table_provider is None:
@@ -788,36 +1283,63 @@ class HybridIndex:
         doc_ids = self._matching_doc_ids(filters)
         if not doc_ids:
             return []
-        indicator = extract_indicator(query)
-        row_label, _ = extract_dimension_labels(query)
-        periods: list[str] = []
-        month = re.search(r"(20\d{2})年\s*0?(\d{1,2})月", normalize_text(query))
-        if month:
-            periods.append(f"{month.group(1)}-{int(month.group(2)):02d}")
-        else:
-            year = re.search(r"(20\d{2})年", normalize_text(query))
-            if year:
-                periods.append(year.group(1))
+        structured = structured or {}
+        indicator = normalize_text(structured.get("indicator")) or extract_indicator(query)
+
+        # When the planner supplied structured dimensions, do not run the old
+        # row parser as a second semantic authority. In institution-by-column
+        # sheets it can mistake “大型商业银行” for a row label and make SQLite
+        # return zero candidates.
+        parsed_row, _ = extract_dimension_labels(query)
+        row_label = normalize_text(structured.get("row_label")) or (
+            None if structured else parsed_row
+        )
+
+        periods = _table_period_candidates(query, structured)
         collected: dict[str, dict[str, Any]] = {}
 
         def fetch(**kwargs: Any) -> None:
             for item in self._table_provider(doc_ids=doc_ids, limit=20000, **kwargs):
                 collected[str(item.get("evidence_id"))] = item
 
-        # Exact indicator/row and period predicates use SQLite indexes and
-        # cover normal table lookups.  Add broader scoped passes for tables
-        # whose indicator is stored in a neighbouring/header cell.
-        if indicator or row_label or periods:
-            fetch(indicator=indicator, periods=periods, row_label=row_label)
-            if indicator or row_label:
-                fetch(indicator=indicator, row_label=row_label)
-        else:
+        # High-recall progressive retrieval. Start with the strongest explicit
+        # structured keys, but never let one uncertain dimension zero out the
+        # whole task. The final semantic filter in RetrievalTools verifies the
+        # exact indicator/institution/period.
+        if indicator and periods:
+            fetch(indicator=indicator, periods=periods)
+        if indicator:
+            fetch(indicator=indicator)
+        if row_label and periods:
+            fetch(row_label=row_label, periods=periods)
+        if row_label:
+            fetch(row_label=row_label)
+        if periods and not collected:
+            fetch(periods=periods)
+        if not (indicator or row_label or periods):
             fetch()
+
         if formula:
             fetch(text_terms=["不良贷款余额", "各项贷款余额"])
+
         if not collected:
-            fetch(text_terms=[term for term in re.findall(r"[\u4e00-\u9fffA-Za-z]{2,}", normalize_text(query))[:8]])
+            terms = [
+                term
+                for term in re.findall(r"[\u4e00-\u9fffA-Za-z]{2,}", normalize_text(query))
+                if term not in {"数值", "查询", "数据"}
+            ][:8]
+            if terms:
+                fetch(text_terms=terms)
+
+        # Last scoped fallback: if the user explicitly selected a document and
+        # structured passes still found nothing, scan a bounded slice of that
+        # document rather than failing because of parser/schema drift.
+        if not collected and doc_ids and len(doc_ids) <= 8:
+            fetch()
+
         return list(collected.values())
+
+
 
     def _search_tables_lazy(
         self,
@@ -829,9 +1351,14 @@ class HybridIndex:
         lexical: bool,
         metadata: bool,
         fuse: bool,
+        structured: dict[str, Any] | None = None,
     ) -> list[Hit]:
         """Run the existing table scorer over only SQL-selected candidates."""
-        items = self._lazy_table_candidates(query, filters)
+        items = self._lazy_table_candidates(
+            query,
+            filters,
+            structured=structured,
+        )
         if not items:
             return []
         # Reuse the thoroughly tested in-memory scorer without rebuilding the
@@ -852,6 +1379,7 @@ class HybridIndex:
             lexical=lexical,
             metadata=metadata,
             fuse=fuse,
+            structured=structured,
         )
         for key, value in bounded._runtime_usage.items():
             self._runtime_usage[key] = self._runtime_usage[key] or value

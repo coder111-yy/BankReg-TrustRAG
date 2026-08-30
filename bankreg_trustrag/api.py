@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
+import traceback
 import uuid
 from pathlib import Path
 from typing import Annotated, Any
@@ -12,6 +14,9 @@ from pydantic import BaseModel, Field
 
 from .config import Settings
 from .service import TrustRAGService
+
+
+logger = logging.getLogger("bankreg_trustrag.api")
 
 
 class QARequest(BaseModel):
@@ -92,21 +97,45 @@ def create_app(settings: Settings | None = None):
         if not conversation_id:
             conversation_id = "conv_" + uuid.uuid4().hex
             service.store.create_conversation(conversation_id, scope)
-        short_term = service.store.recent_conversation_messages(conversation_id, scope, limit=8)
-        recalled = service.store.recall_memories(scope, request.question, exclude_conversation_id=conversation_id, limit=4)
-        context_messages = [*short_term]
-        if _looks_like_follow_up(request.question):
-            context_messages.extend({"role": "user", "content": item["question"], "memory_type": "long_term"} for item in recalled)
+        # Always pass recent chat history to the LLM with original roles.
+        # Python no longer decides whether the current message is a follow-up.
+        short_term = service.store.recent_conversation_messages(
+            conversation_id,
+            scope,
+            limit=12,
+        )
+        context_messages = _conversation_context(short_term)
+
+        # Long-term memory can still be displayed/audited, but is deliberately
+        # not injected into the planner by default. It is not regulatory
+        # evidence and short replies such as “一季度” are easily contaminated by
+        # unrelated historical questions.
+        recalled = service.store.recall_memories(
+            scope,
+            request.question,
+            exclude_conversation_id=conversation_id,
+            limit=4,
+        )
+
+        # Persist the current user turn before execution. In OpenAI-compatible
+        # chat format role="user" is the HumanMessage semantic role.
+        # The planner receives prior context + request.question separately, so
+        # the current turn is not duplicated in the LLM request.
         service.store.add_conversation_message(
             "msg_" + uuid.uuid4().hex,
             conversation_id,
             scope,
             "user",
             request.question,
+            metadata={"message_type": "human"},
         )
         conversation = service.store.get_conversation(conversation_id, scope) or {}
         if conversation.get("title") == "新对话":
-            service.store.update_conversation_title(conversation_id, scope, _conversation_title(request.question))
+            service.store.update_conversation_title(
+                conversation_id,
+                scope,
+                _conversation_title(request.question),
+            )
 
         async def event_stream():
             loop = asyncio.get_running_loop()
@@ -119,12 +148,24 @@ def create_app(settings: Settings | None = None):
             yield _sse_event(
                 "memory",
                 {
-                    "short_term_messages": len(short_term),
+                    "short_term_messages": len(context_messages),
                     "long_term_matches": len(recalled),
                     "long_term_questions": [item["question"][:120] for item in recalled],
-                    "note": "记忆仅用于理解上下文，不能替代本地监管资料证据。",
+                    "note": "最近对话按 user/assistant 角色直接交给大模型理解；长期记忆仅供参考，不作为本轮监管证据。",
                 },
             )
+            # This event is emitted before the worker starts, so even an
+            # immediate worker exception can no longer leave an empty
+            # “智能体执行记录 · — ms”.
+            yield _sse_event(
+                "status",
+                {
+                    "stage": "request_accepted",
+                    "label": "请求已接收，正在进入智能体执行",
+                    "elapsed_ms": 0,
+                },
+            )
+
             task = asyncio.create_task(asyncio.to_thread(
                 service.ask,
                 request.question,
@@ -134,20 +175,70 @@ def create_app(settings: Settings | None = None):
                 context_messages,
                 observe,
             ))
-            while not task.done():
-                try:
-                    update = await asyncio.wait_for(progress.get(), timeout=0.12)
-                    yield _sse_event("status", update)
-                except TimeoutError:
-                    continue
-            while not progress.empty():
-                yield _sse_event("status", progress.get_nowait())
+
             try:
+                while not task.done():
+                    try:
+                        update = await asyncio.wait_for(progress.get(), timeout=0.12)
+                        yield _sse_event("status", update)
+                    except TimeoutError:
+                        continue
+
+                # observe() uses loop.call_soon_threadsafe().  Give those
+                # callbacks one event-loop turn before the final drain; without
+                # this, a very fast failure can finish the worker before its
+                # first status callback reaches the asyncio.Queue.
+                await asyncio.sleep(0)
+                while not progress.empty():
+                    yield _sse_event("status", progress.get_nowait())
+
                 response = await task
-            except Exception:
-                yield _sse_event("error", {"message": "本次问答未完成，请稍后重试。"})
+
+            except asyncio.CancelledError:
+                # asyncio.to_thread cannot stop a Python function that is
+                # already running.  TrustRAGService serializes ask() internally,
+                # so an orphaned worker cannot overlap the next request.
+                logger.warning(
+                    "chat stream disconnected while worker was running; "
+                    "conversation_id=%s",
+                    conversation_id,
+                )
+                raise
+
+            except Exception as exc:
+                # Do not hide the real exception.  Uvicorn/PyCharm terminal
+                # receives the complete traceback, while the browser gets only
+                # a safe error type and a retry hint.
+                logger.exception(
+                    "chat stream worker failed; conversation_id=%s question=%r",
+                    conversation_id,
+                    request.question[:160],
+                )
+                print(
+                    "\n[BankReg-TrustRAG] chat worker exception\n"
+                    + "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+                    flush=True,
+                )
+
+                # Recreate transient LLM/agent clients for the next request.
+                # This is the programmatic equivalent of the part of a restart
+                # that previously made the system recover.
+                try:
+                    await asyncio.to_thread(service.recover_runtime)
+                except Exception:
+                    logger.exception("automatic runtime recovery also failed")
+
+                yield _sse_event(
+                    "error",
+                    {
+                        "message": "本次问答执行异常，运行时已自动重置，请直接重试。",
+                        "error_type": type(exc).__name__,
+                    },
+                )
                 return
+
             response_data = response.to_dict()
+
             service.store.add_conversation_message(
                 "msg_" + uuid.uuid4().hex,
                 conversation_id,
@@ -278,9 +369,29 @@ def _safe_memory_scope(value: str) -> str:
     return scope
 
 
-def _looks_like_follow_up(question: str) -> bool:
-    compact = re.sub(r"\s+", "", question)
-    return len(compact) <= 80 and any(token in compact for token in ("这个", "那个", "上述", "刚才", "前面", "继续", "再", "那", "它"))
+def _conversation_context(
+    messages: list[dict[str, Any]] | None,
+    *,
+    max_messages: int = 12,
+) -> list[dict[str, str]]:
+    """Transport recent chat turns without doing intent classification."""
+    cleaned: list[dict[str, str]] = []
+    for item in messages or []:
+        role = str(item.get("role") or "").strip().lower()
+        if role not in {"user", "assistant"}:
+            continue
+        content = re.sub(r"\s+", " ", str(item.get("content") or "")).strip()
+        if not content:
+            continue
+        if (
+            cleaned
+            and role == "user"
+            and cleaned[-1]["role"] == "user"
+            and cleaned[-1]["content"] == content
+        ):
+            continue
+        cleaned.append({"role": role, "content": content})
+    return cleaned[-max(2, int(max_messages)):]
 
 
 def _conversation_title(question: str) -> str:
