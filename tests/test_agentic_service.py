@@ -4,10 +4,10 @@ import time
 from bankreg_trustrag.agentic_executor import BoundedAgentExecutor
 from bankreg_trustrag.answer_generator import AnswerGenerationOutcome, GeneratedAnswer
 from bankreg_trustrag.calculator import Calculator
-from bankreg_trustrag.query_plan import QueryPlan
+from bankreg_trustrag.query_plan import QueryPlan, RetrievalResult
 from bankreg_trustrag.query_planner import PlannerOutcome
 from bankreg_trustrag.retrieval.index import HybridIndex
-from bankreg_trustrag.retrieval_tools import RetrievalTools
+from bankreg_trustrag.retrieval_tools import RetrievalExecution, RetrievalTools
 from bankreg_trustrag.service import TrustRAGService
 
 
@@ -55,6 +55,14 @@ class _Planner:
         return PlannerOutcome("ok", _plan(), 1)
 
 
+class _PlannerWithPlan:
+    def __init__(self, plan):
+        self.plan_value = plan
+
+    def plan(self, *args, **kwargs):
+        return PlannerOutcome("ok", self.plan_value, 1)
+
+
 class _FailedPlanner:
     def __init__(self, status="error", delay=0.0):
         self.status = status
@@ -81,6 +89,36 @@ class _Answerer:
             answered_requirement_ids=["ar1", "ar2"],
             output_refs_by_requirement={"ar1": ["calc_total"], "ar2": ["calc_diff"]},
         ), 1)
+
+
+class _NoEvidenceTools:
+    def execute(self, task):
+        return RetrievalExecution(RetrievalResult(
+            task_id=task.id,
+            status="not_found",
+            expected_information=task.expected_information,
+        ), [])
+
+
+def _no_evidence_plan():
+    payload = _plan().model_dump()
+    payload["original_query"] = "根据2026年3月人身险公司经营情况表查询原保险保费收入"
+    payload["user_goal"] = "查询原保险保费收入"
+    payload["answer_requirements"] = [{
+        "id": "ar1",
+        "question": "原保险保费收入是多少",
+        "required_outputs": ["r1"],
+    }]
+    payload["retrieval_tasks"] = [{
+        "id": "r1",
+        "query": "2026年3月人身险公司原保险保费收入",
+        "expected_information": "原保险保费收入数值",
+        "source_scope": {"document_title": "2026年3月人身险公司经营情况表", "year": 2026, "month": 3},
+        "semantic_constraints": {"indicator": "原保险保费收入", "period": "2026-03"},
+        "expected_value_type": "number",
+    }]
+    payload["operations"] = []
+    return QueryPlan.model_validate(payload)
 
 
 class _RepairingAnswerer:
@@ -145,6 +183,22 @@ def test_service_feature_flag_runs_agentic_plan_and_persists_full_trace():
     assert [item["result"] for item in trace["calculation_results"]] == ["45167.97", "0.01"]
     assert trace["answered_requirements"] == ["ar1", "ar2"]
     assert set(trace["latency"]) >= {"planning_ms", "retrieval_ms", "calculation_ms", "generation_ms", "verification_ms", "total_ms"}
+
+
+def test_agentic_no_evidence_returns_explicit_refusal_instead_of_internal_error():
+    service = _service()
+    plan = _no_evidence_plan()
+    service.agentic_executor = BoundedAgentExecutor(
+        _PlannerWithPlan(plan), _NoEvidenceTools(), Calculator(), _Answerer()
+    )
+
+    response = service.ask(plan.original_query)
+
+    assert response.answer == "根据当前检索到的资料，未找到能够支持该问题的证据，系统拒绝回答。"
+    assert response.evidence == []
+    assert response.trust["decision"] == "refuse"
+    assert any("未检索到可引用证据" in reason for reason in response.trust["reasons"])
+    assert response.query_plan["execution_trace"]["execution_error"]["no_evidence"] is True
 
 
 def test_service_asks_answer_agent_to_repair_fact_failure_without_retrieval_or_recalculation():

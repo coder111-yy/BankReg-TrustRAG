@@ -45,6 +45,7 @@ Copy-Item .env.example .env
 ```
 
 打开 `http://127.0.0.1:8000/`。首次 BGE 查询可能需要建立本地向量索引。
+如果本地数据库来自旧版本，启动时会自动迁移新增字段和索引，不要删除 `artifacts/bankreg.sqlite3`。
 
 ## 4. 验证
 

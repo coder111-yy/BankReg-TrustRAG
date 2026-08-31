@@ -489,7 +489,12 @@ def _period_scope(value: str) -> tuple[int | None, int | None, int | None]:
     return (int(year.group(1)), None, None) if year else (None, None, None)
 
 
-_EXPLICIT_UNIT_RE = re.compile(r"万亿元|亿元|百万元|万元|万件|百分比|[%％‰]|元|件")
+# ``件`` is a valid reporting unit, but it also occurs inside ordinary words
+# such as ``附件``、``文件`` and ``事件``.  Match the compound count unit first
+# and only accept standalone ``件`` when it is not part of these words.
+_EXPLICIT_UNIT_RE = re.compile(
+    r"万亿元|亿元|百万元|万元|万件|百分比|[%％‰]|元|(?<![附文事条案部])件"
+)
 
 
 def _explicit_expected_unit(question: str, suggested: str | None) -> str | None:

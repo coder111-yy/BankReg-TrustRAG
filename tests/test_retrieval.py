@@ -2,6 +2,8 @@ import json
 
 from bankreg_trustrag.retrieval.index import HybridIndex
 from bankreg_trustrag.query import parse_query
+from bankreg_trustrag.query_plan import RetrievalTask
+from bankreg_trustrag.retrieval_tools import RetrievalTools
 from bankreg_trustrag.storage import Store
 
 
@@ -137,6 +139,44 @@ def test_annual_bank_table_maps_march_to_first_quarter():
     hits = index.search_tables("2025年3月商业银行主要监管指标情况表中的不良贷款率是多少", top_k=3, filters={"title": ["商业银行主要监管指标情况表"]})
 
     assert hits and hits[0].item["cell_address"] == "B14"
+
+
+def test_task_retrieval_matches_chinese_quarter_context_with_slash_separator():
+    index = HybridIndex(
+        [{"doc_id": "quarter", "title": "2023年银行业金融机构保障性安居工程贷款情况表(季度)", "file_name": "quarter.xlsx", "status": "effective"}],
+        [],
+        [{
+            "evidence_id": "cell:quarter:B6",
+            "doc_id": "quarter",
+            "indicator": "保障性安居工程贷款",
+            "period": "2023",
+            "row_header": "商业银行合计",
+            "column_header": "一季度",
+            "value_text": "123.45",
+            "cell_address": "B6",
+            "context": "商业银行合计 | 2023年 / 一季度 | 123.45",
+        }],
+    )
+    task = RetrievalTask.model_validate({
+        "id": "r1",
+        "query": "2023年一季度保障性安居工程贷款",
+        "expected_information": "商业银行合计一季度数值",
+        "source_scope": {"year": 2023, "quarter": 1},
+        "semantic_constraints": {
+            "indicator": "保障性安居工程贷款",
+            "institution": "商业银行合计",
+            "period": "2023年一季度",
+            "row_label": "商业银行合计",
+            "column_label": "一季度",
+        },
+        "expected_value_type": "number",
+    })
+
+    execution = RetrievalTools(index).execute(task)
+
+    assert execution.result.status == "resolved"
+    assert execution.result.selected is not None
+    assert execution.result.selected.value == "123.45"
 
 
 def test_formula_evidence_is_retrievable_when_indicator_and_formula_are_separate_cells():

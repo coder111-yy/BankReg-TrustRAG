@@ -122,6 +122,8 @@ BANKREG_BGE_MODE=auto
 .\.venv\Scripts\python.exe -m uvicorn server:app --host 127.0.0.1 --port 8000
 ```
 
+如果是 `git pull` 后首次启动，旧版 `artifacts/bankreg.sqlite3` 会在服务启动时自动补齐新增字段和索引，无需删除数据库或重新导入数据。
+
 浏览器打开：
 
 ```text

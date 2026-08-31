@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import ast
 import json
+import re
 from dataclasses import dataclass
 from typing import Any, TypeVar
 
@@ -142,8 +144,9 @@ class LLMClient:
                     max_tokens=max_tokens,
                     response_format=response_format,
                     timeout_seconds=timeout_seconds,
+                    disable_thinking=_is_deepseek(self.config),
                 )
-                payload = json.loads(text)
+                payload = _decode_structured_payload(text)
                 value = output_model.model_validate(payload)
                 if use_native_schema:
                     self._json_schema_supported = True
@@ -174,6 +177,7 @@ class LLMClient:
         max_tokens: int | None,
         response_format: dict[str, Any] | None = None,
         timeout_seconds: float | None = None,
+        disable_thinking: bool = False,
     ) -> str:
         payload: dict[str, Any] = {
             "model": self.config.model,
@@ -183,6 +187,11 @@ class LLMClient:
         }
         if response_format:
             payload["response_format"] = response_format
+        # Structured planning needs a short final JSON object, not a hidden
+        # reasoning trace.  DeepSeek-compatible endpoints support this switch;
+        # do not send the provider-specific field to unrelated OpenAI servers.
+        if disable_thinking and _is_deepseek(self.config):
+            payload["thinking"] = {"type": "disabled"}
         headers = {"Content-Type": "application/json"}
         if self.config.api_key:
             headers["Authorization"] = f"Bearer {self.config.api_key}"
@@ -201,15 +210,118 @@ def _chat_completions_url(base_url: str) -> str:
     return base if base.endswith("/chat/completions") else f"{base}/chat/completions"
 
 
+def _is_deepseek(config: LLMClientConfig) -> bool:
+    provider = config.provider.strip().lower()
+    base_url = (config.base_url or "").lower()
+    return provider == "deepseek" or "api.deepseek.com" in base_url
+
+
 def _response_text(body: dict[str, Any]) -> str:
     choices = body.get("choices")
     if not isinstance(choices, list) or not choices:
         raise ValueError("missing_choices")
-    message = choices[0].get("message") or {}
+    choice = choices[0] if isinstance(choices[0], dict) else {}
+    message = choice.get("message") or {}
     content = message.get("content") if isinstance(message, dict) else None
     if isinstance(content, list):
-        content = "".join(str(part.get("text") or "") for part in content if isinstance(part, dict))
+        content = "".join(
+            str(part.get("text") or part.get("content") or "")
+            for part in content
+            if isinstance(part, dict)
+        )
+    # A few OpenAI-compatible gateways return completion-style ``text`` even
+    # when the request uses the chat endpoint.  Accept it without ever using
+    # ``reasoning_content`` as an answer source.
+    if not content:
+        content = choice.get("text") or choice.get("delta", {}).get("content")
     text = str(content or "").strip()
     if not text:
         raise ValueError("empty_model_content")
     return text
+
+
+def _decode_structured_payload(text: str) -> Any:
+    """Decode common model-wrapped JSON without weakening schema validation.
+
+    OpenAI-compatible providers generally honour ``response_format=json_object``,
+    but some model deployments still wrap the object in Markdown or emit a
+    Python-dict spelling (single quotes/``True``/``None``).  The old direct
+    ``json.loads`` call treated those harmless transport variations as a
+    planner failure.  We extract one balanced object and use
+    ``ast.literal_eval`` only as a safe compatibility parser; the caller still
+    validates the resulting value against the strict Pydantic model.
+    """
+    candidates = _structured_payload_candidates(text)
+    last_error: Exception | None = None
+    for candidate in candidates:
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError as exc:
+            last_error = exc
+        try:
+            return ast.literal_eval(candidate)
+        except (SyntaxError, ValueError, MemoryError) as exc:
+            last_error = exc
+        # A few providers omit quotes around simple object keys. Repair only
+        # that syntactic form; values are never rewritten or inferred.
+        repaired = re.sub(
+            r"([{,]\s*)([A-Za-z_][A-Za-z0-9_-]*)\s*:",
+            r'\1"\2":',
+            candidate,
+        )
+        if repaired != candidate:
+            try:
+                return json.loads(repaired)
+            except json.JSONDecodeError as exc:
+                last_error = exc
+            try:
+                return ast.literal_eval(repaired)
+            except (SyntaxError, ValueError, MemoryError) as exc:
+                last_error = exc
+    if isinstance(last_error, json.JSONDecodeError):
+        raise last_error
+    raise json.JSONDecodeError("Expecting JSON object", text, 0)
+
+
+def _structured_payload_candidates(text: str) -> list[str]:
+    cleaned = text.strip()
+    candidates: list[str] = []
+    if cleaned:
+        candidates.append(cleaned)
+    # Remove only a surrounding Markdown fence; balanced extraction below also
+    # handles prose such as "Here is the JSON:" and <think> wrappers.
+    fenced = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.IGNORECASE).strip()
+    if fenced and fenced not in candidates:
+        candidates.append(fenced)
+    extracted = _extract_balanced_object(cleaned)
+    if extracted and extracted not in candidates:
+        candidates.append(extracted)
+    return candidates
+
+
+def _extract_balanced_object(text: str) -> str | None:
+    start = text.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:index + 1]
+    return None

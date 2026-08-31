@@ -219,9 +219,15 @@ class BoundedAgentExecutor:
         state.completeness = output_check
         if not output_check.complete:
             state.unresolved_requirements = list(output_check.missing_requirement_ids)
+            no_evidence = not state.hits
             state.execution_error = {
-                "stage": "output_binding",
-                "reason": "已完成执行，但部分结果未能绑定到回答要求",
+                "stage": "retrieval" if no_evidence else "output_binding",
+                "reason": (
+                    "未检索到可引用证据"
+                    if no_evidence
+                    else "已完成执行，但部分结果未能绑定到回答要求"
+                ),
+                "no_evidence": no_evidence,
                 "missing_output_count": len(output_check.missing_outputs),
             }
             return state

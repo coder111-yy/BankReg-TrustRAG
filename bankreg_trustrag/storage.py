@@ -63,6 +63,13 @@ CREATE TABLE IF NOT EXISTS document_relations (
   FOREIGN KEY(source_doc_id) REFERENCES documents(doc_id),
   FOREIGN KEY(target_doc_id) REFERENCES documents(doc_id)
 );
+"""
+
+
+# Index creation is intentionally separate from the table schema.  Existing
+# databases may have been created before one of the indexed columns existed;
+# migrations must add those columns before SQLite parses these statements.
+INDEX_SCHEMA = """
 CREATE INDEX IF NOT EXISTS idx_text_doc ON text_evidence(doc_id);
 CREATE INDEX IF NOT EXISTS idx_table_doc ON table_evidence(doc_id);
 CREATE INDEX IF NOT EXISTS idx_table_indicator ON table_evidence(indicator);
@@ -89,6 +96,7 @@ class Store:
         self.connection.row_factory = sqlite3.Row
         self.connection.executescript(SCHEMA)
         self._ensure_ingestion_columns()
+        self.connection.executescript(INDEX_SCHEMA)
 
     def _ensure_ingestion_columns(self) -> None:
         """Add task-1 metadata columns to an existing SQLite file in place."""
@@ -119,12 +127,6 @@ class Store:
                 for column, sql_type in columns.items():
                     if column not in existing:
                         self.connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
-            self.connection.execute("CREATE INDEX IF NOT EXISTS idx_table_cell_type ON table_evidence(cell_type)")
-            self.connection.execute("CREATE INDEX IF NOT EXISTS idx_table_numeric_value ON table_evidence(numeric_value)")
-            self.connection.execute("CREATE INDEX IF NOT EXISTS idx_table_institution ON table_evidence(institution)")
-            self.connection.execute("CREATE INDEX IF NOT EXISTS idx_table_region ON table_evidence(region)")
-            self.connection.execute("CREATE INDEX IF NOT EXISTS idx_document_family ON documents(family_title)")
-            self.connection.execute("CREATE INDEX IF NOT EXISTS idx_document_reporting_period ON documents(reporting_period)")
 
     def close(self) -> None:
         self.connection.close()

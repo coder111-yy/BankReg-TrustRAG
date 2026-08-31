@@ -149,7 +149,10 @@ class TrustRAGService:
             answer = _agentic_clarification_answer(state)
             claims: list[str] = []
         elif state.execution_error is not None:
-            answer = "系统已取得相关证据，但内部结果绑定未完成，请稍后重试。"
+            if not state.hits:
+                answer = "根据当前检索到的资料，未找到能够支持该问题的证据，系统拒绝回答。"
+            else:
+                answer = "已检索到部分证据，但内部结果绑定未完成，暂时无法可靠回答。"
             claims = []
         else:
             answer = state.final_answer or "当前工具结果不足，无法可靠回答。"
@@ -193,7 +196,11 @@ class TrustRAGService:
         elif state.execution_error is not None:
             trust["decision"] = "refuse"
             trust["score"] = min(float(trust.get("score", 0.0)), 0.2)
-            trust.setdefault("reasons", []).append("内部执行结果绑定失败")
+            if not state.hits:
+                trust["components"]["evidence"] = 0.0
+                trust.setdefault("reasons", []).append("未检索到可引用证据，拒绝回答")
+            else:
+                trust.setdefault("reasons", []).append("内部执行结果绑定失败")
         elif state.final_answer:
             # The Answer Agent owns semantic entailment.  A deterministic audit
             # warning is visible in trace/trust reasons, but is non-blocking.
@@ -268,7 +275,9 @@ class TrustRAGService:
                 "查询规划失败，已返回重试提示"
                 if state.planner_status != "ok"
                 else (
-                    "内部执行未完成，请重试"
+                    "未检索到可引用证据，已拒绝回答"
+                    if state.execution_error is not None and not state.hits
+                    else "内部执行未完成，请重试"
                     if state.execution_error is not None
                     else "回答完整性与证据核验已完成"
                 )

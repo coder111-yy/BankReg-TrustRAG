@@ -1,4 +1,5 @@
 import json
+import re
 from types import SimpleNamespace
 
 from bankreg_trustrag.llm_client import LLMClient, LLMClientConfig
@@ -140,6 +141,103 @@ def test_llm_client_retries_invalid_structured_output(monkeypatch):
     assert '"required_outputs"' in calls[1]["messages"][-1]["content"]
 
 
+def test_llm_client_accepts_wrapped_python_dict_from_provider(monkeypatch):
+    malformed_but_unambiguous = "模型说明：\n```json\n" + repr(_plan_payload()) + "\n```"
+    monkeypatch.setattr(
+        "bankreg_trustrag.llm_client.httpx.post",
+        lambda *args, **kwargs: _Response(malformed_but_unambiguous),
+    )
+    client = LLMClient(LLMClientConfig(
+        provider="openai_compatible",
+        model="deepseek",
+        base_url="http://local/v1",
+    ))
+
+    result = client.structured(
+        [{"role": "user", "content": "plan"}],
+        QueryPlan,
+        temperature=0.0,
+    )
+
+    assert result.status == "ok"
+    assert result.value is not None
+    assert result.value.user_goal == "查询总资产"
+    assert result.attempts == 1
+
+
+def test_deepseek_structured_request_disables_thinking(monkeypatch):
+    calls = []
+
+    def fake_post(*args, **kwargs):
+        calls.append(kwargs["json"])
+        return _Response(json.dumps(_compact_plan_payload(), ensure_ascii=False))
+
+    monkeypatch.setattr("bankreg_trustrag.llm_client.httpx.post", fake_post)
+    client = LLMClient(LLMClientConfig(
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        base_url="https://api.deepseek.com",
+    ))
+
+    result = client.structured(
+        [{"role": "user", "content": "plan"}],
+        PlannerOutput,
+        temperature=0.0,
+        prefer_json_schema=False,
+    )
+
+    assert result.status == "ok"
+    assert calls[0]["thinking"] == {"type": "disabled"}
+
+
+def test_llm_client_accepts_compatibility_completion_text(monkeypatch):
+    class CompletionResponse(_Response):
+        def json(self):
+            return {"choices": [{"text": json.dumps(_plan_payload(), ensure_ascii=False)}]}
+
+    monkeypatch.setattr(
+        "bankreg_trustrag.llm_client.httpx.post",
+        lambda *args, **kwargs: CompletionResponse("unused"),
+    )
+    client = LLMClient(LLMClientConfig(
+        provider="openai_compatible",
+        model="local",
+        base_url="http://local/v1",
+    ))
+
+    result = client.structured(
+        [{"role": "user", "content": "plan"}],
+        QueryPlan,
+        temperature=0.0,
+    )
+
+    assert result.status == "ok"
+
+
+def test_llm_client_repairs_unquoted_object_keys(monkeypatch):
+    payload = json.dumps(_plan_payload(), ensure_ascii=False)
+    malformed = re.sub(r'"([A-Za-z_][A-Za-z0-9_]*)":', r'\1:', payload)
+    monkeypatch.setattr(
+        "bankreg_trustrag.llm_client.httpx.post",
+        lambda *args, **kwargs: _Response(malformed),
+    )
+    client = LLMClient(LLMClientConfig(
+        provider="openai_compatible",
+        model="deepseek",
+        base_url="http://local/v1",
+    ))
+
+    result = client.structured(
+        [{"role": "user", "content": "plan"}],
+        QueryPlan,
+        temperature=0.0,
+    )
+
+    assert result.status == "ok"
+    assert result.value is not None
+    assert result.value.user_goal == "查询总资产"
+
+
 def test_query_planner_preserves_application_original_question(monkeypatch):
     payload = _compact_plan_payload()
     calls = []
@@ -211,6 +309,28 @@ def test_query_planner_canonicalizes_absolute_difference_operand_order(monkeypat
     assert outcome.plan.operations[1].parameters["absolute"] is True
 
 
+def test_query_planner_repairs_omitted_subtraction_semantics(monkeypatch):
+    payload = _cross_file_compact_payload()
+    payload["operations"][1].pop("absolute")
+    monkeypatch.setattr(
+        "bankreg_trustrag.llm_client.httpx.post",
+        lambda *args, **kwargs: _Response(json.dumps(payload, ensure_ascii=False)),
+    )
+    planner = QueryPlanner(LLMClient(LLMClientConfig(
+        provider="openai_compatible",
+        model="planner",
+        base_url="http://local/v1",
+    )))
+
+    directional = planner.plan("商业银行合计从一季度到四季度的数值变化为多少？")
+    assert directional.status == "ok"
+    assert directional.plan.operations[1].parameters["absolute"] is False
+
+    absolute = planner.plan("两类公司合计与全国总数相差多少？")
+    assert absolute.status == "ok"
+    assert absolute.plan.operations[1].parameters["absolute"] is True
+
+
 def test_query_planner_removes_ungrounded_unit_and_completes_aggregate_column(monkeypatch):
     monkeypatch.setattr(
         "bankreg_trustrag.llm_client.httpx.post",
@@ -255,6 +375,25 @@ def test_query_planner_keeps_only_a_unit_explicitly_requested_by_user(monkeypatc
     outcome = planner.plan("请以亿元为单位查询2024年9月保险业总资产。")
 
     assert outcome.plan.retrieval_tasks[0].expected_unit == "亿元"
+
+
+def test_query_planner_does_not_treat_attachment_as_unit(monkeypatch):
+    payload = _compact_plan_payload()
+    payload["retrieval_tasks"][0]["expected_unit"] = "件"
+    monkeypatch.setattr(
+        "bankreg_trustrag.llm_client.httpx.post",
+        lambda *args, **kwargs: _Response(json.dumps(payload, ensure_ascii=False)),
+    )
+    planner = QueryPlanner(LLMClient(LLMClientConfig(
+        provider="openai_compatible",
+        model="planner",
+        base_url="http://local/v1",
+    )))
+
+    outcome = planner.plan("需要对Excel附件做两处取数并计算。")
+
+    assert outcome.status == "ok"
+    assert outcome.plan.retrieval_tasks[0].expected_unit is None
 
 
 def test_query_planner_fails_closed_when_llm_is_disabled():
