@@ -32,12 +32,21 @@ class RetrievalTools:
         task = _normalized_task(task)
         query = _task_query(task)
         filters = _task_filters(task)
-        expects_table = task.expected_value_type in {"number", "table_cell"} or any([
-            task.semantic_constraints.indicator,
-            task.semantic_constraints.parent_indicator,
-            task.semantic_constraints.row_label,
-            task.semantic_constraints.column_label,
-        ])
+        semantic = task.semantic_constraints
+        # An indicator is also a perfectly valid Word/PDF concept (definition,
+        # disclosure duty, threshold, formula explanation).  Routing every
+        # indicator task to Excel made source-scoped regulatory evidence
+        # impossible to retrieve.  Table routing requires a table-shaped output
+        # or actual structured coordinates, not merely an indicator name.
+        expects_table = bool(
+            task.expected_value_type in {"number", "table_cell"}
+            or semantic.row_label
+            or semantic.column_label
+            or (
+                semantic.period
+                and any((semantic.indicator, semantic.institution, semantic.region))
+            )
+        )
         search_type = "table_lookup" if expects_table else "regulatory_fact"
         if expects_table:
             source = task.source_scope
@@ -542,12 +551,17 @@ def _text_result(task: RetrievalTask, hits: list[Hit], index: Any) -> RetrievalE
 
     ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
     best_support = ranked[0][0]
-    keep_floor = max(0.22, best_support - 0.22)
+    # Exact source scoping is already a strong provenance constraint.  Long
+    # regulatory tasks mention several requested fields, so one supporting
+    # paragraph naturally has lower n-gram coverage than a short fact query.
+    source_scoped = bool(task.source_scope.document_title)
+    minimum_support = 0.16 if source_scoped else 0.36
+    keep_floor = max(minimum_support, best_support - 0.22)
     kept = [item for item in ranked if item[0] >= keep_floor][:6]
     candidates = [item[2] for item in kept]
     candidate_hits = [item[3] for item in kept]
 
-    if best_support < 0.36:
+    if best_support < minimum_support:
         return RetrievalExecution(RetrievalResult(
             task_id=task.id,
             status="not_found",

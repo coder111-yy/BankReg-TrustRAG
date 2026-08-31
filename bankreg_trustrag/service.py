@@ -59,7 +59,10 @@ class TrustRAGService:
     def _refresh_agentic_executor(self) -> None:
         answer_client = LLMClient.from_settings(self.settings)
         self.agentic_executor = BoundedAgentExecutor(
-            QueryPlanner.from_settings(self.settings),
+            QueryPlanner.from_settings(
+                self.settings,
+                document_catalog=list(getattr(self.index, "documents", []) or []),
+            ),
             RetrievalTools(self.index, max(self.settings.top_k, 12)),
             Calculator(),
             AnswerGenerator.from_settings(self.settings, answer_client),
@@ -81,10 +84,20 @@ class TrustRAGService:
         if hasattr(self.index, "begin_query"):
             self.index.begin_query()
         _, inline_choices = extract_inline_choices(question)
-        has_choices = bool(valid_choices(choices or inline_choices))
-        if bool(getattr(self.settings, "agentic_planner_enabled", False)) and not has_choices:
-            response = self._ask_agentic(
+        effective_choices = valid_choices(choices or inline_choices)
+        planning_question = question
+        # API clients may send choices in a separate JSON field.  The planner
+        # must see the same complete task that the Answer Agent will answer;
+        # inline options are already present and must not be duplicated.
+        if effective_choices and not inline_choices:
+            labels = "ABCDEFGH"
+            planning_question = "\n".join([
                 question,
+                *(f"{labels[index]}. {choice}" for index, choice in enumerate(effective_choices)),
+            ])
+        if bool(getattr(self.settings, "agentic_planner_enabled", False)):
+            response = self._ask_agentic(
+                planning_question,
                 conversation_context,
                 observer,
                 request_started=request_started,

@@ -1385,7 +1385,13 @@ class HybridIndex:
         requested_month = _structured_month_number(structured)
         requested_year = _structured_year_number(structured)
 
-        if not row_target or not dimension_target:
+        # A source-scoped row plus an explicit quarter/month already identifies
+        # one scalar cell.  Requiring a second column_label made valid plans
+        # such as indicator=流动性覆盖率, year=2024, quarter=4 fall back to a
+        # broad semantic search and often miss the requested workbook.
+        if not row_target:
+            return None
+        if not dimension_target and not (requested_quarter or requested_month):
             return None
         if not (requested_quarter or requested_month or normalize_text(structured.get("period"))):
             return None
@@ -1404,24 +1410,8 @@ class HybridIndex:
         normalized_row_target = _canonical_label(row_target)
         normalized_dimension = canonical_dimension_label(dimension_target)
         selected: list[Hit] = []
-        print("\n" + "=" * 100)
-        print("[STRUCTURED EXACT DEBUG]")
-        print("row_target =", repr(row_target))
-        print("normalized_row_target =", repr(normalized_row_target))
-        print("dimension_target =", repr(dimension_target))
-        print("normalized_dimension =", repr(normalized_dimension))
-        print("requested_year =", requested_year)
-        print("requested_quarter =", requested_quarter)
-        print("requested_month =", requested_month)
-        print("source_rows =", len(items))
-        print("=" * 100)
 
         for raw_item in items:
-            raw_indicator = raw_item.get("indicator")
-            raw_row = raw_item.get("row_header")
-            raw_column = raw_item.get("column_header")
-
-            # 只打印与“流动性覆盖率”可能有关的行，避免刷屏
             debug_blob = normalize_text(
                 " ".join(
                     str(raw_item.get(k) or "")
@@ -1434,29 +1424,13 @@ class HybridIndex:
                 )
             )
 
-            is_debug_target = (
-                    normalized_row_target in _canonical_label(debug_blob)
-                    or normalized_dimension in canonical_dimension_label(debug_blob)
-            )
             # Table lookup tasks in this fast path are scalar-cell lookups.
             if normalized_number(raw_item.get("value_text")) is None:
                 continue
 
             item_indicator = _canonical_label(raw_item.get("indicator"))
             item_row = _canonical_label(raw_item.get("row_header"))
-            if is_debug_target:
-                print("\n[EXACT CANDIDATE]")
-                print("evidence_id =", raw_item.get("evidence_id"))
-                print("raw indicator =", repr(raw_indicator))
-                print("canonical indicator =", repr(item_indicator))
-                print("raw row =", repr(raw_row))
-                print("canonical row =", repr(item_row))
-                print("raw column =", repr(raw_column))
-                print("value_text =", repr(raw_item.get("value_text")))
             row_ok = normalized_row_target in {item_indicator, item_row}
-
-            if is_debug_target:
-                print("row_ok =", row_ok)
 
             if not row_ok:
                 continue
@@ -1465,15 +1439,7 @@ class HybridIndex:
                 str(raw_item.get(key) or "")
                 for key in ("column_header", "row_header", "context")
             ))
-            dimension_ok = normalized_dimension in dimension_blob
-
-            if is_debug_target:
-                print("dimension_blob =", repr(dimension_blob))
-                print("dimension_ok =", dimension_ok)
-
-            if not dimension_ok:
-                continue
-            if normalized_dimension not in dimension_blob:
+            if normalized_dimension and normalized_dimension not in dimension_blob:
                 continue
 
             period_match, inferred_period = _structured_item_period_match(
@@ -1485,10 +1451,6 @@ class HybridIndex:
                 month_anchors=month_anchors,
                 documents=self.doc_by_id,
             )
-            if is_debug_target:
-                print("period_match =", period_match)
-                print("inferred_period =", inferred_period)
-                print("-" * 80)
             if not period_match:
                 continue
 
@@ -1499,9 +1461,9 @@ class HybridIndex:
 
             score = 20.0
             column = canonical_dimension_label(item.get("column_header"))
-            if column and normalized_dimension == column:
+            if normalized_dimension and column and normalized_dimension == column:
                 score += 8.0
-            elif normalized_dimension in dimension_blob:
+            elif normalized_dimension and normalized_dimension in dimension_blob:
                 score += 4.0
 
             if item_indicator == normalized_row_target:
@@ -1570,11 +1532,6 @@ class HybridIndex:
         if self._table_provider is None:
             return [dict(item) for item in self.tables]
         doc_ids = self._matching_doc_ids(filters)
-        print("\n" + "=" * 100)
-        print("[TABLE DEBUG]")
-        print("query =", query)
-        print("filters =", filters)
-        print("doc_ids =", doc_ids)
         if not doc_ids:
             return []
         structured = structured or {}
@@ -1590,12 +1547,6 @@ class HybridIndex:
         )
 
         periods = _table_period_candidates(query, structured)
-        print("[TABLE DEBUG] structured =", structured)
-        print("[TABLE DEBUG] indicator =", repr(indicator))
-        print("[TABLE DEBUG] parsed_row =", repr(parsed_row))
-        print("[TABLE DEBUG] row_label =", repr(row_label))
-        print("[TABLE DEBUG] periods =", repr(periods))
-        print("=" * 100)
         collected: dict[str, dict[str, Any]] = {}
 
         def fetch(**kwargs: Any) -> None:

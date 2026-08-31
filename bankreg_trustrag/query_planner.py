@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from difflib import SequenceMatcher
 from dataclasses import dataclass
 from typing import Any
 
@@ -115,7 +116,8 @@ class QueryPlanner:
         )
         compact = review.value if review.status == "ok" and isinstance(review.value, PlannerOutput) else draft
         compact = _canonicalize_planner_sources(compact, self.document_catalog)
-        plan = _expand_planner_output(normalized_question, compact)
+        plan = _source_grounded_choice_plan(normalized_question, compact)
+        plan = plan or _expand_planner_output(normalized_question, compact)
         diagnostics = tuple(first.errors or ()) + tuple(review.errors or ())
         attempts = int(first.attempts or 0) + int(review.attempts or 0)
         return PlannerOutcome("ok", plan, attempts, diagnostics=diagnostics)
@@ -311,8 +313,17 @@ def _expand_planner_output(question: str, compact: PlannerOutput) -> QueryPlan:
     for item in compact.retrieval_tasks:
         period = normalize_text(item.period) or None
         year, month, quarter = _period_scope(period or item.query)
+        has_numeric_coordinate = bool(
+            period
+            or year
+            or month
+            or quarter
+            or item.row_label
+            or item.column_label
+            or re.search(r"\.(?:xlsx?|xls)(?:$|\b)", normalize_text(item.source_hint), re.IGNORECASE)
+        )
         expected_type = item.expected_value_type or (
-            "number" if item.id in calculation_inputs else "text"
+            "number" if item.id in calculation_inputs and has_numeric_coordinate else "text"
         )
         expected_unit = _explicit_expected_unit(question, item.expected_unit)
         column_label = _planner_column_label(item)
@@ -346,11 +357,63 @@ def _expand_planner_output(question: str, compact: PlannerOutput) -> QueryPlan:
         _append_unique(regions, item.region)
         _append_unique(units, expected_unit)
 
+    structured_numeric_refs = {
+        task.id
+        for task in retrieval_tasks
+        if (
+            task.source_scope.year
+            or task.source_scope.month
+            or task.source_scope.quarter
+            or task.semantic_constraints.period
+            or task.semantic_constraints.row_label
+            or task.semantic_constraints.column_label
+            or normalize_text(task.source_scope.document_type).lower() in {"excel", "xls", "xlsx"}
+        )
+    }
+    numeric_retrieval_refs = {
+        task.id
+        for task in retrieval_tasks
+        if task.expected_value_type in {"number", "table_cell"} and task.id in structured_numeric_refs
+    }
     operations: list[CalculationTask] = []
     prior_outputs: set[str] = set()
     for index, item in enumerate(compact.operations, 1):
-        inputs = list(item.inputs)
-        if item.type == "subtract" and item.absolute is True and len(inputs) == 2:
+        inputs = [
+            _resolve_plan_reference(
+                ref,
+                retrieval_tasks,
+                prior_outputs,
+            )
+            for ref in item.inputs
+        ]
+        left = _resolve_plan_reference(item.left, retrieval_tasks, prior_outputs) if item.left else None
+        right = _resolve_plan_reference(item.right, retrieval_tasks, prior_outputs) if item.right else None
+        old_ref = _resolve_plan_reference(item.old_ref, retrieval_tasks, prior_outputs) if item.old_ref else None
+        new_ref = _resolve_plan_reference(item.new_ref, retrieval_tasks, prior_outputs) if item.new_ref else None
+        # The LLM may include a supporting rule-text task alongside the two
+        # numeric operands of compare/divide.  Keep that rule bound to the
+        # answer requirement, but never pass it into a binary calculator.
+        if item.type in {"compare", "divide"} and len(inputs) != 2:
+            structured_operands = [ref for ref in inputs if ref in structured_numeric_refs]
+            retrieval_operands = [ref for ref in inputs if ref in numeric_retrieval_refs]
+            available_operands = [
+                ref for ref in inputs
+                if ref in numeric_retrieval_refs or ref in prior_outputs
+            ]
+            if len(structured_operands) >= 2:
+                inputs = structured_operands[:2]
+            elif len(retrieval_operands) >= 2:
+                inputs = retrieval_operands[:2]
+            elif len(available_operands) >= 2:
+                inputs = available_operands[:2]
+            elif len(inputs) > 2:
+                # Supporting evidence is conventionally listed before operands.
+                inputs = inputs[-2:]
+
+        absolute = item.absolute
+        if item.type == "subtract" and not (left and right) and len(inputs) == 2 and absolute is None:
+            absolute = _infer_absolute_subtraction(question)
+        if item.type == "subtract" and absolute is True and len(inputs) == 2:
             # Absolute difference is commutative. Canonicalize a derived
             # calculation before a raw retrieval so traces are stable across
             # equivalent model outputs: abs(calc1 - r3), not abs(r3 - calc1).
@@ -366,18 +429,42 @@ def _expand_planner_output(question: str, compact: PlannerOutput) -> QueryPlan:
             "type": item.type,
             "output_id": item.output_id,
             "inputs": inputs,
-            "left": item.left,
-            "right": item.right,
-            "old_ref": item.old_ref,
-            "new_ref": item.new_ref,
-            "parameters": ({"absolute": item.absolute} if item.absolute is not None else {}),
+            "left": left,
+            "right": right,
+            "old_ref": old_ref,
+            "new_ref": new_ref,
+            "parameters": ({"absolute": absolute} if absolute is not None else {}),
         })
         operations.append(operation)
         prior_outputs.add(operation.output_id)
+
+    available_outputs = {
+        *(task.id for task in retrieval_tasks),
+        *(operation.output_id for operation in operations),
+    }
+    expanded_requirements = []
+    calculation_output_ids = {operation.output_id for operation in operations}
+    for requirement in compact.answer_requirements:
+        resolved = [
+            _resolve_plan_reference(ref, retrieval_tasks, calculation_output_ids)
+            for ref in requirement.required_outputs
+        ]
+        resolved = list(dict.fromkeys(ref for ref in resolved if ref in available_outputs))
+        # A model-generated semantic alias must never make an otherwise valid
+        # execution plan impossible to bind.  If none of its aliases can be
+        # resolved, the Answer Agent may use any completed plan output.
+        if not resolved:
+            resolved = list(dict.fromkeys([
+                *(task.id for task in retrieval_tasks),
+                *(operation.output_id for operation in operations),
+            ]))
+        expanded_requirements.append(requirement.model_copy(update={
+            "required_outputs": resolved,
+        }))
     return QueryPlan.model_validate({
         "original_query": question,
         "user_goal": compact.user_goal,
-        "answer_requirements": [item.model_dump() for item in compact.answer_requirements],
+        "answer_requirements": [item.model_dump() for item in expanded_requirements],
         "entities": {
             "indicators": indicators,
             "institutions": institutions,
@@ -404,6 +491,71 @@ def _expand_planner_output(question: str, compact: PlannerOutput) -> QueryPlan:
     })
 
 
+def _infer_absolute_subtraction(question: str) -> bool:
+    """Infer only the missing subtraction direction from explicit wording."""
+    text = normalize_text(question)
+    if re.search(r"从.+到|上升|下降|增加|减少|变化|变动", text):
+        return False
+    return any(term in text for term in ("相差", "差值", "差额", "绝对差"))
+
+
+def _resolve_plan_reference(
+    reference: str,
+    retrieval_tasks: list[RetrievalTask],
+    calculation_outputs: set[str],
+) -> str:
+    """Bind an LLM semantic alias to one executable task/output ID."""
+    reference = normalize_text(reference)
+    if not reference:
+        return reference
+    exact_ids = {task.id for task in retrieval_tasks} | set(calculation_outputs)
+    if reference in exact_ids:
+        return reference
+
+    candidates: dict[str, str] = {
+        task.id: " ".join(str(value or "") for value in (
+            task.id,
+            task.query,
+            task.expected_information,
+            task.source_scope.document_title,
+            task.source_scope.year,
+            task.source_scope.month,
+            task.source_scope.quarter,
+            task.semantic_constraints.indicator,
+            task.semantic_constraints.period,
+            task.semantic_constraints.row_label,
+            task.semantic_constraints.column_label,
+        ))
+        for task in retrieval_tasks
+    }
+    candidates.update({output: output for output in calculation_outputs})
+
+    years = set(re.findall(r"(?:19|20)\d{2}", reference))
+    if years:
+        matches = [key for key, blob in candidates.items() if years <= set(re.findall(r"(?:19|20)\d{2}", blob))]
+        if len(matches) == 1:
+            return matches[0]
+
+    numbers = set(re.findall(r"(?<!\d)\d{1,3}(?!\d)", reference))
+    if numbers:
+        matches = [key for key, blob in candidates.items() if numbers <= set(re.findall(r"(?<!\d)\d{1,3}(?!\d)", blob))]
+        if len(matches) == 1:
+            return matches[0]
+
+    reference_key = re.sub(r"[^0-9a-z]+", "", reference.lower())
+    scored = sorted(
+        (
+            SequenceMatcher(None, reference_key, re.sub(r"[^0-9a-z]+", "", key.lower())).ratio(),
+            key,
+        )
+        for key in candidates
+        if reference_key
+    )
+    if scored and scored[-1][0] >= 0.48:
+        return scored[-1][1]
+    return reference
+
+
 
 _CHOICE_MARKER_RE = re.compile(r"(?<![A-Za-z0-9])([A-H])\s*[.．、)]\s*", re.IGNORECASE)
 
@@ -423,7 +575,17 @@ def _source_grounded_choice_plan(question: str, compact: PlannerOutput) -> Query
     stem = normalized[:markers[0].start()]
     if not re.search(r"哪(?:一)?项|下列|表述|正确|错误|符合|不符合", stem):
         return None
-    if re.search(r"Excel|工作表|单元格|数值|金额|余额|占比|变化|差值|计算", stem, re.IGNORECASE):
+    # A title inside 《》 is not proof that the question has only one source.
+    # Annual workbooks are often referenced by logical name without brackets,
+    # e.g. “依据《办法》附件并核对2024、2025监管指标表”.  Collapsing that
+    # question to the quoted rule document erases both table retrieval tasks.
+    years = set(re.findall(r"(?<!\d)(?:19|20)\d{2}(?!\d)", stem))
+    if len(years) >= 2 or re.search(
+        r"Excel|工作表|单元格|数值|金额|余额|占比|变化|差值|计算|"
+        r"报表|统计表|监管指标|核对|对照|比较|相比|多个?文件|多份(?:文件|材料)",
+        stem,
+        re.IGNORECASE,
+    ):
         return None
     source_titles = [normalize_text(value) for value in re.findall(r"《([^》]{2,160})》", stem)]
     source_titles = [value for value in source_titles if value]
