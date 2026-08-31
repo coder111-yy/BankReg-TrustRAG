@@ -1379,7 +1379,7 @@ class HybridIndex:
 
         # Strong coordinates only.  Generic/free-text table queries still use
         # BM25/BGE/RRF.
-        row_target = indicator or row_label
+        row_target = row_label or institution or indicator
         dimension_target = column_label or institution or region
         requested_quarter = _structured_quarter_number(structured)
         requested_month = _structured_month_number(structured)
@@ -1434,7 +1434,10 @@ class HybridIndex:
                 )
             )
 
-            is_debug_target = "流动性覆盖率" in debug_blob
+            is_debug_target = (
+                    normalized_row_target in _canonical_label(debug_blob)
+                    or normalized_dimension in canonical_dimension_label(debug_blob)
+            )
             # Table lookup tasks in this fast path are scalar-cell lookups.
             if normalized_number(raw_item.get("value_text")) is None:
                 continue

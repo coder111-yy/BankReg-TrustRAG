@@ -1,11 +1,5 @@
 from __future__ import annotations
 
-import os
-
-os.environ.setdefault("HF_ENABLE_PARALLEL_LOADING", "false")
-os.environ.setdefault("HF_PARALLEL_LOADING_WORKERS", "1")
-import logging
-import threading
 import time
 import uuid
 import re
@@ -30,20 +24,12 @@ from .retrieval_tools import RetrievalTools
 from .schemas import QAResponse
 from .storage import Store
 from .utils import char_ngrams, normalize_text
-from .verification import trust_decision, verify_claims, verify_evidence_guard
-
-
-logger = logging.getLogger("bankreg_trustrag.service")
+from .verification import trust_decision, verify_claims
 
 
 class TrustRAGService:
     def __init__(self, settings: Settings, store: Store | None = None):
         self.settings = settings
-        # The BGE pipeline, planner clients and runtime usage state are shared
-        # by the service instance. Serialize QA execution so an abandoned
-        # SSE request cannot keep running in a worker thread while a new
-        # request enters the same model/index objects.
-        self._ask_lock = threading.RLock()
         self.store = store or Store(settings.db_path)
         self.generator = GroundedGenerator.from_settings(settings)
         if self.store.document_count() == 0 and (settings.artifact_dir / "documents.jsonl").exists():
@@ -66,108 +52,22 @@ class TrustRAGService:
         self._refresh_agentic_executor()
 
     def reload(self) -> None:
-        with self._ask_lock:
-            self.store.load_jsonl(self.settings.artifact_dir)
-            self.index = HybridIndex.from_store(
-                self.store,
-                semantic=self.semantic,
-                vector_dir=self.settings.bge_vector_dir,
-            )
-            self._refresh_agentic_executor()
-
-    def recover_runtime(self) -> None:
-        """Reset transient agent/LLM state without rebuilding the corpus.
-
-        A failed HTTP/model client should not require restarting Uvicorn.
-        The index and database remain intact; only short-lived agent clients are
-        recreated.  Text-vector initialization can retry on its own after the
-        earlier _text_vectors_ready fix.
-        """
-        with self._ask_lock:
-            self._refresh_agentic_executor()
+        self.store.load_jsonl(self.settings.artifact_dir)
+        self.index = HybridIndex.from_store(self.store, semantic=self.semantic, vector_dir=self.settings.bge_vector_dir)
+        self._refresh_agentic_executor()
 
     def _refresh_agentic_executor(self) -> None:
         answer_client = LLMClient.from_settings(self.settings)
         self.agentic_executor = BoundedAgentExecutor(
-            QueryPlanner.from_settings(
-                self.settings,
-                document_catalog=getattr(self.index, "documents", []),
-            ),
+            QueryPlanner.from_settings(self.settings),
             RetrievalTools(self.index, max(self.settings.top_k, 12)),
             Calculator(),
             AnswerGenerator.from_settings(self.settings, answer_client),
             CompletenessChecker(),
             max_answer_attempts=int(getattr(self.settings, "agentic_max_answer_attempts", 2)),
-            max_steps=int(getattr(self.settings, "agentic_max_steps", 8)),
         )
 
     def ask(
-        self,
-        question: str,
-        choices: list[str] | None = None,
-        qa_type: str | None = None,
-        filters: dict[str, Any] | None = None,
-        conversation_context: list[dict[str, Any]] | None = None,
-        observer: Callable[[str, dict[str, Any]], None] | None = None,
-    ) -> QAResponse:
-        """Run one QA request with process-local serialization and recovery.
-
-        StreamingResponse cancellation cannot terminate an already-running
-        asyncio.to_thread worker.  Serializing here prevents those orphaned
-        workers from concurrently using the shared BGE/LLM runtime.
-        """
-        acquired = self._ask_lock.acquire(blocking=False)
-        if not acquired:
-            if observer is not None:
-                observer(
-                    "runtime_queue",
-                    {
-                        "elapsed_ms": 0,
-                        "label": "已有请求仍在执行，当前请求正在等待运行时资源",
-                    },
-                )
-            self._ask_lock.acquire()
-
-        try:
-            try:
-                return self._ask_once(
-                    question,
-                    choices,
-                    qa_type,
-                    filters,
-                    conversation_context,
-                    observer,
-                )
-            except Exception as exc:
-                if not _is_retryable_runtime_error(exc):
-                    raise
-
-                logger.exception("transient QA runtime failure; retrying once")
-                if observer is not None:
-                    observer(
-                        "runtime_recovery",
-                        {
-                            "elapsed_ms": 0,
-                            "label": "检测到临时运行异常，正在自动重置并重试一次",
-                        },
-                    )
-
-                # Recreate planner/answer LLM clients.  Do not rebuild the
-                # database or corpus and do not alter retrieval semantics.
-                self._refresh_agentic_executor()
-
-                return self._ask_once(
-                    question,
-                    choices,
-                    qa_type,
-                    filters,
-                    conversation_context,
-                    observer,
-                )
-        finally:
-            self._ask_lock.release()
-
-    def _ask_once(
         self,
         question: str,
         choices: list[str] | None = None,
@@ -181,16 +81,12 @@ class TrustRAGService:
         if hasattr(self.index, "begin_query"):
             self.index.begin_query()
         _, inline_choices = extract_inline_choices(question)
-        effective_choices = valid_choices(choices or inline_choices)
-        # Multiple-choice is an answer format, not a retrieval route. When the
-        # LLM planner is enabled, every question is planned first; the legacy
-        # Choice Agent remains only as a fallback when the planner is disabled.
-        if bool(getattr(self.settings, "agentic_planner_enabled", False)):
+        has_choices = bool(valid_choices(choices or inline_choices))
+        if bool(getattr(self.settings, "agentic_planner_enabled", False)) and not has_choices:
             response = self._ask_agentic(
                 question,
                 conversation_context,
                 observer,
-                choices=effective_choices,
                 request_started=request_started,
             )
             if response is not None:
@@ -211,7 +107,6 @@ class TrustRAGService:
         conversation_context: list[dict[str, Any]] | None,
         observer: Callable[[str, dict[str, Any]], None] | None,
         *,
-        choices: list[str] | None = None,
         request_started: float | None = None,
     ) -> QAResponse | None:
         started = request_started if request_started is not None else time.perf_counter()
@@ -220,82 +115,12 @@ class TrustRAGService:
             if observer is not None:
                 observer(stage, {"elapsed_ms": int((time.perf_counter() - started) * 1000), **details})
 
-        # If choices came through the API as a separate array, expose them to
-        # Planner/Answer Agent. They are candidates only, never evidence.
-        # Inline A/B/C/D questions are left unchanged.
-        agentic_question = _agentic_question_with_choices(question, choices)
-
         executor = getattr(self, "agentic_executor", None)
         if executor is None:
             if str(getattr(self.settings, "agentic_planner_failure_mode", "legacy")) == "legacy":
                 return None
             raise RuntimeError("agentic executor is not initialized")
-        state: AgentState = executor.run(agentic_question, conversation_context, report)
-
-        # ------------------------------------------------------------------
-        # DEBUG: print the actual evidence retrieved by the Agentic pipeline.
-        # This is intentionally placed immediately after executor.run(), so it
-        # shows retrieval results before answer generation / verification can
-        # change the final presentation. Remove this block after debugging.
-        # ------------------------------------------------------------------
-        print("\n" + "=" * 100, flush=True)
-        print("【DEBUG】本轮 Agentic 检索结果", flush=True)
-        print(f"question: {question}", flush=True)
-        print(f"agentic_question: {agentic_question}", flush=True)
-        print(f"planner_status: {state.planner_status}", flush=True)
-        print("=" * 100, flush=True)
-
-        print("\n【1】RetrievalTask / RetrievalResult", flush=True)
-        if not state.retrieval_results:
-            print("  (没有 retrieval_results)", flush=True)
-        for task_id, result in state.retrieval_results.items():
-            print("\n" + "-" * 100, flush=True)
-            print(f">>> Task: {task_id}", flush=True)
-            print(f"status: {getattr(result, 'status', None)}", flush=True)
-            print(f"expected_information: {getattr(result, 'expected_information', None)}", flush=True)
-
-            selected = getattr(result, "selected", None)
-            if selected is not None:
-                try:
-                    selected_data = selected.model_dump()
-                except Exception:
-                    selected_data = selected
-                print("SELECTED:", flush=True)
-                print(selected_data, flush=True)
-            else:
-                print("SELECTED: None", flush=True)
-
-            candidates = list(getattr(result, "candidates", None) or [])
-            print(f"CANDIDATES: {len(candidates)}", flush=True)
-            for idx, candidate in enumerate(candidates, 1):
-                try:
-                    candidate_data = candidate.model_dump()
-                except Exception:
-                    candidate_data = candidate
-                print(f"  [{idx}] {candidate_data}", flush=True)
-
-        print("\n【2】state.hits：真正汇总进入后续生成/核验的全部证据", flush=True)
-        print(f"hit_count: {len(state.hits)}", flush=True)
-        for idx, hit in enumerate(state.hits, 1):
-            item = getattr(hit, "item", {}) or {}
-            content = str(item.get("content") or item.get("context_window") or item.get("context") or "")
-            if len(content) > 1200:
-                content = content[:1200] + " ...[truncated]"
-            print("\n" + "-" * 100, flush=True)
-            print(f"[{idx}] evidence_id={getattr(hit, 'evidence_id', None)}", flush=True)
-            print(f"kind={getattr(hit, 'kind', None)}", flush=True)
-            print(f"fused_score={getattr(hit, 'fused_score', None)}", flush=True)
-            print(f"doc_id={item.get('doc_id')}", flush=True)
-            print(f"source_title={item.get('source_title')}", flush=True)
-            print(f"source_file_name={item.get('source_file_name')}", flush=True)
-            print(f"page={item.get('page')} section={item.get('section')} article_no={item.get('article_no')}", flush=True)
-            print(f"sheet_name={item.get('sheet_name')} cell_address={item.get('cell_address')}", flush=True)
-            print(f"indicator={item.get('indicator')} period={item.get('period')} value={item.get('value')}", flush=True)
-            print(f"content/context={content}", flush=True)
-
-        print("\n" + "=" * 100, flush=True)
-        print("【DEBUG】检索结果输出结束", flush=True)
-        print("=" * 100 + "\n", flush=True)
+        state: AgentState = executor.run(question, conversation_context, report)
         failure_mode = str(getattr(self.settings, "agentic_planner_failure_mode", "legacy") or "legacy").lower()
         if state.planner_status == "disabled" and failure_mode == "legacy":
             if observer is not None:
@@ -323,71 +148,65 @@ class TrustRAGService:
         if state.clarification is not None:
             answer = _agentic_clarification_answer(state)
             claims: list[str] = []
-        elif getattr(state, "refusal_reason", None):
-            answer = "当前资料中未检索到足以支持结论的证据，无法可靠回答。"
-            claims = []
         elif state.execution_error is not None:
-            # Internal runtime failures are not evidence refusals and must never
-            # be presented as an output-binding/domain conclusion.
-            answer = "本次请求执行异常，请稍后重试。"
+            answer = "系统已取得相关证据，但内部结果绑定未完成，请稍后重试。"
             claims = []
         else:
-            answer = state.final_answer or "当前资料中未检索到足以支持结论的证据，无法可靠回答。"
+            answer = state.final_answer or "当前工具结果不足，无法可靠回答。"
             claims = split_grounded_claims(answer)
 
-        # Agentic architecture: the LLM is the semantic judge for ALL question types.
-        # Python no longer re-interprets natural-language entailment with string/ngram rules.
-        # It only enforces deterministic provenance and factual constraints.
+        # Verification is audit-only.  Once retrieval/calculation outputs have
+        # been delivered to the Answer Agent, the LLM is the final semantic
+        # judge of whether those facts support the natural-language answer.
+        # Python verification is retained for traceability and diagnostics, but
+        # it must never rewrite, repair, reject, or replace an LLM answer.
         verification_started = time.perf_counter()
-        generated = state.answer_outcome.generated if state.answer_outcome is not None else None
-        grounding_refs = _expanded_agentic_grounding_refs(
-            state,
-            generated.output_refs_by_requirement if generated is not None else None,
-        )
-        verification = verify_evidence_guard(
+        verification = verify_claims(
             answer,
             question,
             state.hits,
             claims,
             operations,
             completeness=(None if state.execution_error is not None else state.completeness),
-            grounding_refs=grounding_refs,
-            declared_evidence_ids=(generated.supporting_evidence_ids if generated is not None else None),
-            llm_supported=(bool(generated.supported) if generated is not None else False),
-            need_more_evidence=(bool(generated.need_more_evidence) if generated is not None else True),
+            grounding_refs=(
+                state.answer_outcome.generated.output_refs_by_requirement
+                if state.answer_outcome else None
+            ),
         )
         verification_ms = int((time.perf_counter() - verification_started) * 1000)
         verification_attempts = [verification.to_dict()]
         state.latency["verification_ms"] = verification_ms
-        trust = trust_decision(state.hits, verification, qa_type, self.settings.min_trust, 0.9 if state.final_answer else 0.0)
+
+        trust = trust_decision(
+            state.hits,
+            verification,
+            qa_type,
+            self.settings.min_trust,
+            0.9 if state.final_answer else 0.0,
+        )
         if state.clarification is not None:
             trust["decision"] = "clarify"
             trust["score"] = min(float(trust.get("score", 0.0)), 0.45)
-            trust.setdefault("reasons", []).append(str(state.clarification.get("reason") or "需要补充信息"))
-        elif getattr(state, "refusal_reason", None):
+            trust.setdefault("reasons", []).append(
+                str(state.clarification.get("reason") or "需要补充信息")
+            )
+        elif state.execution_error is not None:
             trust["decision"] = "refuse"
             trust["score"] = min(float(trust.get("score", 0.0)), 0.2)
-            trust.setdefault("reasons", []).append(str(state.refusal_reason))
-        elif state.execution_error is not None:
-            # Runtime failure is kept distinct from an evidence-based refusal.
-            trust["decision"] = "clarify"
-            trust["score"] = min(float(trust.get("score", 0.0)), 0.1)
-            trust.setdefault("reasons", []).append("本次智能体执行异常，可重试")
-        elif not verification.passed:
-            trust["decision"] = "clarify"
-            trust.setdefault("reasons", []).append("回答未通过确定性证据守门")
-            # Only deterministic provenance/number/date/unit failures can reach here.
-            # Semantic entailment has already been decided by the LLM.
-            answer = "当前回答包含未由本轮证据或确定性计算支持的事实，无法可靠返回。"
+            trust.setdefault("reasons", []).append("内部执行结果绑定失败")
+        elif state.final_answer:
+            # The Answer Agent owns semantic entailment.  A deterministic audit
+            # warning is visible in trace/trust reasons, but is non-blocking.
+            trust["decision"] = "answer"
+            if not verification.passed:
+                trust.setdefault("reasons", []).append(
+                    "确定性核验存在审计告警；最终语义判断以Answer Agent为准"
+                )
 
         trace = state.trace()
         trace["verification"] = verification.to_dict()
-        trace["llm_semantic_decision"] = {
-            "supported": (bool(generated.supported) if generated is not None else False),
-            "need_more_evidence": (bool(generated.need_more_evidence) if generated is not None else True),
-            "supporting_evidence_ids": (list(generated.supporting_evidence_ids) if generated is not None else []),
-            "mode": "llm_semantic_judge_plus_deterministic_guard",
-        }
+        trace["verification_mode"] = "audit_only"
+        trace["answer_authority"] = "llm_answer_agent"
         trace["verification_attempts"] = verification_attempts
         trace["latency"] = {**trace.get("latency", {}), "verification_ms": verification_ms}
         latency = int((time.perf_counter() - started) * 1000)
@@ -399,13 +218,13 @@ class TrustRAGService:
             "calculation": plan.requires_calculation,
             "comparison": any(item.type in {"compare", "max", "min", "subtract", "growth_rate", "verify_consistency"} for item in plan.operations),
             "multi_hop": bool(plan.operations or len(plan.retrieval_tasks) > 1),
-            "option_evaluation": bool(choices),
+            "option_evaluation": False,
         }
         query_plan = {
             "original_query": question,
             "qa_type": qa_type,
             "intent": plan.user_goal,
-            "answer_format": "multiple_choice" if choices else "free_text",
+            "answer_format": "free_text",
             "requirements": requirements,
             "entities": plan.entities.model_dump(),
             "retrieval_routes": [
@@ -422,7 +241,7 @@ class TrustRAGService:
             "operations": operations,
             "execution_trace": trace,
             "agent_workflow": {
-                "mode": "adaptive_plan_act_observe_replan",
+                "mode": "explicit_bounded_state_machine",
                 "answer_generation": {
                     "strategy": "llm_grounded" if state.answer_outcome and state.answer_outcome.status == "ok" else "api_failure_fallback",
                     "status": state.answer_outcome.status if state.answer_outcome else None,
@@ -449,13 +268,9 @@ class TrustRAGService:
                 "查询规划失败，已返回重试提示"
                 if state.planner_status != "ok"
                 else (
-                    "多轮检索后证据仍不足"
-                    if getattr(state, "refusal_reason", None)
-                    else (
-                        "本次智能体执行异常，请重试"
-                        if state.execution_error is not None
-                        else "自适应检索与LLM证据判断已完成"
-                    )
+                    "内部执行未完成，请重试"
+                    if state.execution_error is not None
+                    else "回答完整性与证据核验已完成"
                 )
             )
             observer("completed", {"elapsed_ms": latency, "label": label})
@@ -888,53 +703,6 @@ class TrustRAGService:
         response = QAResponse(answer, parsed.qa_type, [], verification.to_dict(), trust, trace_id, latency, plan)
         self.store.save_qa(trace_id, original_question, parsed.qa_type, plan, [], answer, trust["score"], verification.to_dict(), trust["decision"], latency)
         return response
-
-
-
-def _is_retryable_runtime_error(exc: Exception) -> bool:
-    """Recognize transport/runtime failures that commonly recover after restart."""
-    if isinstance(exc, (TimeoutError, ConnectionError)):
-        return True
-
-    name = type(exc).__name__.lower()
-    text = str(exc).lower()
-    markers = (
-        "timeout",
-        "timed out",
-        "connection",
-        "network",
-        "transport",
-        "connection reset",
-        "connection refused",
-        "remote protocol",
-        "server disconnected",
-        "client has been closed",
-        "session is closed",
-        "database is locked",
-        "database table is locked",
-        "recursive use of cursors",
-        "temporarily unavailable",
-        "broken pipe",
-        "too many requests",
-        "429",
-        "502",
-        "503",
-        "504",
-    )
-    retryable_names = (
-        "connecterror",
-        "readtimeout",
-        "writetimeout",
-        "pooltimeout",
-        "remoteprotocolerror",
-        "connectionerror",
-        "operationalerror",
-    )
-    return any(marker in text for marker in markers) or any(
-        token in name for token in retryable_names
-    )
-
-
 
 
 def _choice_answer_draft(choice_result: Any) -> AnswerDraft:
@@ -1483,65 +1251,6 @@ def _active_retrieval_routes(index: Any) -> list[str]:
     return [label for key, label in mapping if status.get(key)]
 
 
-
-def _agentic_question_with_choices(question: str, choices: list[str] | None) -> str:
-    """Expose API-supplied options to the planner without treating them as evidence."""
-    options = valid_choices(choices or [])
-    if not options:
-        return question
-
-    # Inline options are already part of the HumanMessage. Avoid duplicating
-    # them, because duplicate years/numbers can distort the planner.
-    _, inline = extract_inline_choices(question)
-    if valid_choices(inline):
-        return question
-
-    rendered = "\n".join(
-        f"{chr(ord('A') + index)}. {option}"
-        for index, option in enumerate(options)
-    )
-    return (
-        f"{question.rstrip()}\n\n"
-        "候选选项（仅供最终判断，选项内容不是证据）：\n"
-        f"{rendered}"
-    )
-
-
-
-def _expanded_agentic_grounding_refs(
-    state: AgentState,
-    refs_by_requirement: dict[str, list[str]] | None,
-) -> dict[str, list[str]] | None:
-    """Expand Answer-Agent task/result refs to exact evidence provenance."""
-    if not refs_by_requirement:
-        return None
-    expanded: dict[str, list[str]] = {}
-    for requirement_id, refs in refs_by_requirement.items():
-        values: list[str] = []
-        for raw_ref in refs or []:
-            ref = str(raw_ref)
-            if ref and ref not in values:
-                values.append(ref)
-
-            retrieval = state.retrieval_results.get(ref)
-            if retrieval is not None:
-                for evidence_id in retrieval.evidence_ids:
-                    evidence_id = str(evidence_id)
-                    if evidence_id and evidence_id not in values:
-                        values.append(evidence_id)
-
-            calculation = state.calculation_results.get(ref)
-            if calculation is not None:
-                for evidence_id in getattr(calculation, "evidence_ids", []) or []:
-                    evidence_id = str(evidence_id)
-                    if evidence_id and evidence_id not in values:
-                        values.append(evidence_id)
-
-        if values:
-            expanded[str(requirement_id)] = values
-    return expanded or None
-
-
 def _agentic_qa_type(plan: QueryPlan) -> str:
     """Derive the legacy analytics label without using it for execution."""
     if plan.requires_table_retrieval:
@@ -1565,14 +1274,10 @@ def _agentic_display_hits(state: AgentState) -> list[Any]:
 
 
 def _agentic_clarification_answer(state: AgentState) -> str:
-    clarification = state.clarification or {}
-    question = str(clarification.get("question") or "").strip()
-    reason = str(clarification.get("reason") or "问题信息不足").rstrip("。；; ")
+    reason = str((state.clarification or {}).get("reason") or "问题信息不足").rstrip("。；; ")
     if state.planner_status not in {"ok", "not_started"}:
-        return "查询规划服务暂时不可用，请稍后重试。"
-    if question:
-        return question
-    return f"当前问题存在无法通过继续检索消除的歧义：{reason}。"
+        return f"查询规划失败，未执行检索或生成答案，请稍后重试。原因：{reason}。"
+    return f"需要补充信息：{reason}。请补充相应的期间、机构或统计口径后再查询。"
 
 
 def _merge_hits(*groups: list[Any]) -> list[Any]:

@@ -80,11 +80,34 @@ class RetrievalTools:
                 structured=structured,
             )
 
-            hits = [
+            # Structured exact 已经在 Index 内完成：
+            # 1. 精确工作簿范围
+            # 2. 行标签匹配
+            # 3. 列标签匹配
+            # 4. 年/月/季度匹配
+            #
+            # 不要再让通用 semantic filter 将正确精确单元格误杀。
+            exact_hits = [
                 hit
                 for hit in hits
-                if _matches_semantic_constraints(hit, task, self.index)
+                if hit.item.get("_structured_exact_match")
             ]
+
+            if exact_hits:
+                hits = exact_hits
+            else:
+                hits = [
+                    hit
+                    for hit in hits
+                    if _matches_semantic_constraints(
+                        hit,
+                        task,
+                        self.index,
+                    )
+                ]
+
+            return _table_result(task, hits, self.index)
+
 
             return _table_result(task, hits, self.index)
         search = getattr(self.index, "hybrid_search", None)
