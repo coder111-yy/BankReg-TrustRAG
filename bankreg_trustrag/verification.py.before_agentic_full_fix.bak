@@ -81,12 +81,16 @@ def verify_claims(
     calculation_numbers = _deterministic_result_numbers(operations)
     allowed_numbers = [*evidence_numbers, *calculation_numbers]
     for number in answer_numbers:
-        if not any(_decimal_equal(number, expected) for expected in allowed_numbers):
+        claim_text = _claim_containing_number(claims, number) or normalize_text(answer)
+        if not any(
+            _supported_numeric_rendering(number, expected, question=question, claim=claim_text)
+            for expected in allowed_numbers
+        ):
             verification.numeric_ok = False
             rendered = _decimal_text(number)
             _record_failure(
                 verification,
-                claim=_claim_containing_number(claims, number) or normalize_text(answer),
+                claim=claim_text,
                 error_type="unsupported_number",
                 expected={"allowed_numbers": [_decimal_text(value) for value in allowed_numbers]},
                 actual=rendered,
@@ -153,192 +157,6 @@ def verify_claims(
             break
     return verification
 
-
-
-def verify_evidence_guard(
-    answer: str,
-    question: str,
-    hits: list[Hit],
-    claims: list[str],
-    operations: list[dict[str, Any]] | None = None,
-    completeness: Any | None = None,
-    grounding_refs: dict[str, list[str]] | None = None,
-    declared_evidence_ids: list[str] | None = None,
-    *,
-    llm_supported: bool = True,
-    need_more_evidence: bool = False,
-) -> Verification:
-    """Deterministic provenance guard for the Agentic LLM Reasoner.
-
-    This deliberately does NOT decide whether a natural-language conclusion is
-    semantically entailed by evidence.  The LLM already receives the complete
-    evidence pool and performs that judgment.  Python only checks facts that can
-    be validated deterministically: evidence provenance, numbers, dates, units,
-    corpus/version status, and source conflicts.
-    """
-    verification = Verification()
-    operations = operations or []
-
-    if completeness is not None:
-        complete = bool(
-            completeness.get("complete", False)
-            if isinstance(completeness, dict)
-            else getattr(completeness, "complete", completeness)
-        )
-        if not complete:
-            verification.completeness_ok = False
-            missing = (
-                completeness.get("missing_requirement_ids", [])
-                if isinstance(completeness, dict)
-                else list(getattr(completeness, "missing_requirement_ids", []) or [])
-            )
-            _record_failure(
-                verification,
-                claim=normalize_text(answer),
-                error_type="incomplete_answer",
-                expected="所有用户要求均被回答",
-                actual={"missing_requirement_ids": missing},
-                evidence_ids=[hit.evidence_id for hit in hits],
-                calculation_ids=_all_calculation_ids(operations),
-                message="回答未覆盖全部用户要求",
-            )
-
-    if not hits:
-        verification.citation_ok = False
-        _record_failure(
-            verification,
-            claim=normalize_text(answer),
-            error_type="missing_evidence",
-            expected="至少一条本轮检索证据",
-            actual="未检索到证据",
-            calculation_ids=_all_calculation_ids(operations),
-            message="没有检索到可引用证据",
-        )
-        return verification
-
-    available_evidence_ids = {str(hit.evidence_id) for hit in hits if hit.evidence_id}
-    declared = {str(item) for item in (declared_evidence_ids or []) if item}
-    # Service expands RetrievalTask refs to exact evidence IDs. Keep only the
-    # exact evidence references here; task/calculation IDs are checked elsewhere.
-    for refs in (grounding_refs or {}).values():
-        for ref in refs or []:
-            value = str(ref)
-            if value in available_evidence_ids:
-                declared.add(value)
-
-    unknown = sorted(declared - available_evidence_ids)
-    if unknown:
-        verification.citation_ok = False
-        _record_failure(
-            verification,
-            claim=normalize_text(answer),
-            error_type="invalid_evidence_reference",
-            expected=sorted(available_evidence_ids),
-            actual=unknown,
-            evidence_ids=unknown,
-            calculation_ids=_all_calculation_ids(operations),
-            message="回答引用了不属于本轮检索结果的证据",
-        )
-
-    if llm_supported and not declared:
-        verification.citation_ok = False
-        _record_failure(
-            verification,
-            claim=normalize_text(answer),
-            error_type="missing_grounding_reference",
-            expected="LLM结论至少绑定一条本轮 evidence_id",
-            actual=[],
-            evidence_ids=[],
-            calculation_ids=_all_calculation_ids(operations),
-            message="回答没有绑定本轮检索证据",
-        )
-
-    # If the semantic judge itself says evidence is insufficient, Python does
-    # not overrule it. This is not a string-similarity failure; it is the LLM's
-    # own evidence sufficiency decision.
-    if need_more_evidence or not llm_supported:
-        verification.completeness_ok = False
-        _record_failure(
-            verification,
-            claim=normalize_text(answer),
-            error_type="llm_evidence_insufficient",
-            expected="LLM确认当前证据足以回答",
-            actual={"supported": llm_supported, "need_more_evidence": need_more_evidence},
-            evidence_ids=sorted(declared),
-            calculation_ids=_all_calculation_ids(operations),
-            message="LLM判断当前证据仍不足",
-        )
-
-    evidence = "\n".join(_evidence_for_hit(hit) for hit in hits)
-
-    # Hard factual guard: every number stated by the model must come from
-    # evidence or a deterministic Calculator result. Semantic transformations
-    # such as 't > 40' -> '40年以后' naturally pass because 40 is in evidence.
-    answer_numbers = _decimal_numbers(_without_dates(_without_citations(answer)))
-    evidence_numbers = _decimal_numbers(_without_dates(evidence))
-    calculation_numbers = _deterministic_result_numbers(operations)
-    allowed_numbers = [*evidence_numbers, *calculation_numbers]
-    for number in answer_numbers:
-        if not any(_decimal_equal(number, expected) for expected in allowed_numbers):
-            verification.numeric_ok = False
-            rendered = _decimal_text(number)
-            _record_failure(
-                verification,
-                claim=_claim_containing_number(claims, number) or normalize_text(answer),
-                error_type="unsupported_number",
-                expected={"allowed_numbers": [_decimal_text(value) for value in allowed_numbers]},
-                actual=rendered,
-                evidence_ids=sorted(declared) or [hit.evidence_id for hit in hits],
-                calculation_ids=_all_calculation_ids(operations),
-                message=f"数字 {rendered} 未在证据或计算结果中找到",
-            )
-
-    dates = re.findall(r"20\d{2}(?:[-年]\d{1,2}(?:[-月]\d{1,2}日?)?)?", _without_citations(answer))
-    unsupported_dates = [date for date in dates if not _date_supported(date, evidence)]
-    if unsupported_dates:
-        verification.date_ok = False
-        _record_failure(
-            verification,
-            claim=normalize_text(answer),
-            error_type="unsupported_date",
-            expected="日期应出现在证据中",
-            actual=unsupported_dates,
-            evidence_ids=sorted(declared) or [hit.evidence_id for hit in hits],
-            calculation_ids=_all_calculation_ids(operations),
-            message="回答中的日期未被证据支持",
-        )
-
-    _verify_units(answer, evidence, operations, verification, hits)
-    _verify_current_version(question, hits, verification)
-    _detect_evidence_conflicts(hits, verification)
-
-    if not unknown and hits:
-        verification.citation_ok = True
-
-    # Claim-level entries are audit records only in Agentic mode.  They no
-    # longer implement semantic entailment with n-gram/string overlap.
-    audit_evidence_ids = sorted(declared) or [hit.evidence_id for hit in hits]
-    hard_fact_ok = bool(
-        getattr(verification, "numeric_ok", True)
-        and getattr(verification, "date_ok", True)
-        and getattr(verification, "unit_ok", True)
-        and getattr(verification, "citation_ok", True)
-        and llm_supported
-        and not need_more_evidence
-    )
-    verification.claim_results = [
-        {
-            "claim_id": f"claim_{index + 1}",
-            "text": normalize_text(claim),
-            "evidence_ids": audit_evidence_ids,
-            "calculation_ids": _all_calculation_ids(operations),
-            "supported": hard_fact_ok,
-            "verification_mode": "llm_semantic_judge_plus_deterministic_guard",
-        }
-        for index, claim in enumerate(claims)
-        if normalize_text(claim)
-    ]
-    return verification
 
 def _evidence_for_hit(hit: Hit) -> str:
     return " ".join(str(hit.item.get(key) or "") for key in [
@@ -449,7 +267,13 @@ def _calculation_support(
             continue
         operation_numbers = _deterministic_result_numbers([operation])
         numeric_match = bool(operation_numbers) and any(
-            _decimal_equal(claim_number, operation_number)
+            _supported_numeric_rendering(
+                claim_number,
+                operation_number,
+                question="",
+                claim=claim,
+                allow_display_rounding=True,
+            )
             for claim_number in claim_numbers
             for operation_number in operation_numbers
         )
@@ -691,6 +515,55 @@ def _decimal_equal(actual: Decimal, expected: Decimal) -> bool:
         return True
     tolerance = max(Decimal("1e-12"), abs(expected) * Decimal("1e-12"))
     return abs(actual - expected) <= tolerance
+
+
+_APPROXIMATION_TERMS = ("约", "大约", "左右", "近似", "约为", "约等于")
+_NEGATIVE_DIRECTION_TERMS = ("下降", "减少", "降低", "下滑", "回落", "收窄", "减少了", "下降了")
+
+
+def _supported_numeric_rendering(
+    actual: Decimal,
+    expected: Decimal,
+    *,
+    question: str,
+    claim: str,
+    allow_display_rounding: bool = False,
+) -> bool:
+    """Accept faithful display forms without weakening provenance checks.
+
+    Evidence/calculator values remain authoritative. The answer may only change
+    display precision, or express a negative result as a positive magnitude
+    together with an explicit negative direction such as ``下降251.14``.
+    """
+    if _decimal_equal(actual, expected):
+        return True
+
+    context = normalize_text(f"{question} {claim}")
+    approximate = allow_display_rounding or any(term in context for term in _APPROXIMATION_TERMS)
+
+    if approximate and _display_rounding_equal(actual, expected):
+        return True
+
+    if expected < 0 and actual >= 0 and any(term in context for term in _NEGATIVE_DIRECTION_TERMS):
+        magnitude = abs(expected)
+        if _decimal_equal(actual, magnitude):
+            return True
+        if approximate and _display_rounding_equal(actual, magnitude):
+            return True
+
+    return False
+
+
+def _display_rounding_equal(actual: Decimal, expected: Decimal) -> bool:
+    """Accept only a normal Decimal rounding of an already-grounded value."""
+    exponent = actual.as_tuple().exponent
+    places = max(0, -exponent)
+    quantum = Decimal(1).scaleb(-places)
+    try:
+        rounded = expected.quantize(quantum)
+    except InvalidOperation:
+        return False
+    return actual == rounded
 
 
 def _decimal_text(value: Decimal) -> str:

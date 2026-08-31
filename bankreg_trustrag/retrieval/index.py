@@ -290,6 +290,61 @@ def _structured_item_period_match(
 
 
 
+
+def _structured_scan_terms(*values: Any) -> list[str]:
+    """Normalize a multi-level table header into required semantic tokens."""
+    terms: list[str] = []
+    for value in values:
+        text = normalize_text(value)
+        if not text:
+            continue
+        # Accept planner forms such as "截至当期-账面余额",
+        # "截至当期 / 账面余额" and "截至当期→账面余额".
+        for part in re.split(r"\s*(?:/|／|→|->|>|-)\s*", text):
+            canonical = canonical_dimension_label(part)
+            if canonical and canonical not in terms:
+                terms.append(canonical)
+    return terms
+
+
+def _structured_scan_header_match(terms: list[str], header_blob: str) -> bool:
+    """All requested header levels must occur in the candidate header path."""
+    normalized = canonical_dimension_label(header_blob)
+    return bool(terms) and all(term in normalized for term in terms)
+
+
+def _dominant_comparable_unit(hits: list[Hit]) -> list[Hit]:
+    """Keep a single comparable unit before deterministic max/min selection.
+
+    If all values have one unit, keep them all. If multiple units are present,
+    use the uniquely most frequent non-empty unit. A tie is ambiguous and
+    returns an empty list so the normal agent can refine rather than comparing
+    money with percentages.
+    """
+    units = [
+        normalize_text(hit.item.get("unit"))
+        for hit in hits
+        if normalize_text(hit.item.get("unit"))
+    ]
+    if not units:
+        return hits
+
+    counts = Counter(units)
+    if len(counts) == 1:
+        return hits
+
+    ranked = counts.most_common()
+    if len(ranked) > 1 and ranked[0][1] == ranked[1][1]:
+        return []
+
+    dominant = ranked[0][0]
+    return [
+        hit for hit in hits
+        if not normalize_text(hit.item.get("unit"))
+        or normalize_text(hit.item.get("unit")) == dominant
+    ]
+
+
 class HybridIndex:
     """Hybrid lexical/structured index with optional real local BGE retrieval.
 
@@ -751,6 +806,20 @@ class HybridIndex:
     ) -> list[Hit]:
         structured = structured or {}
         if self._table_provider is not None:
+            # A max/min/all request is a set operation, not a top-k semantic
+            # retrieval problem. Scan the complete structured table slice first
+            # so the true extreme cannot be hidden outside BM25/BGE top-k.
+            scan_hits = self._search_tables_structured_scan(
+                query,
+                filters,
+                structured=structured,
+            )
+            if scan_hits is not None:
+                self._runtime_usage["structured_table_used"] = True
+                if metadata and filters:
+                    self._runtime_usage["metadata_filter_used"] = True
+                return scan_hits
+
             exact_hits = self._search_tables_structured_exact(
                 query,
                 top_k,
@@ -1110,6 +1179,168 @@ class HybridIndex:
         return matching
 
 
+
+    def _search_tables_structured_scan(
+        self,
+        query: str,
+        filters: dict[str, Any] | None,
+        *,
+        structured: dict[str, Any] | None = None,
+    ) -> list[Hit] | None:
+        """Scan one complete structured table slice for max/min/all queries.
+
+        This is intentionally different from normal Top-K retrieval.  When the
+        LLM has already identified a source workbook and a column/statistical
+        scope, a question such as "哪项最高" requires *all* comparable numeric
+        cells in that slice.  Ranking 8/64/128 semantically similar cells can
+        miss the true extreme and causes the Agent to retry the same query many
+        times.
+
+        Returning None means the task is not sufficiently structured and the
+        normal exact/hybrid retrieval path should continue.
+        """
+        if self._table_provider is None:
+            return None
+
+        structured = structured or {}
+        selection = normalize_text(structured.get("selection")).lower()
+        if selection not in {"max", "min", "all"}:
+            return None
+
+        # Collection scans need a source-scoped table.  The source resolver in
+        # RetrievalTools already maps logical titles/document families to
+        # concrete doc_ids; scanning an unbounded corpus would be unsafe.
+        doc_ids = self._matching_doc_ids(filters)
+        if not doc_ids or len(doc_ids) > 8:
+            return None
+
+        # The column can be represented as a full multi-level path
+        # ("截至当期 / 账面余额") or split between statistical_scope and
+        # column_label.  Treat every non-empty part as a required header token.
+        column_terms = _structured_scan_terms(
+            structured.get("statistical_scope"),
+            structured.get("column_label"),
+        )
+        if not column_terms:
+            return None
+
+        items = self._structured_source_rows(doc_ids)
+        if not items:
+            return None
+
+        indicator = _canonical_label(structured.get("indicator"))
+        row_label = _canonical_label(structured.get("row_label"))
+        institution = canonical_dimension_label(structured.get("institution"))
+        region = canonical_dimension_label(structured.get("region"))
+
+        requested_year = _structured_year_number(structured)
+        requested_quarter = _structured_quarter_number(structured)
+        requested_month = _structured_month_number(structured)
+        quarter_anchors = _build_period_anchors(items, kind="quarter")
+        month_anchors = _build_period_anchors(items, kind="month")
+
+        selected: list[Hit] = []
+        for raw_item in items:
+            value = raw_item.get("numeric_value")
+            if value is None:
+                value = raw_item.get("value_text", raw_item.get("value"))
+            if normalized_number(value) is None:
+                continue
+
+            # Production table_evidence contains data/text_data/note.  If
+            # cell_type is available, only numeric business data can
+            # participate in an extremum comparison.
+            cell_type = normalize_text(raw_item.get("cell_type")).lower()
+            if cell_type and cell_type != "data":
+                continue
+
+            item_indicator = _canonical_label(raw_item.get("indicator"))
+            item_row = _canonical_label(raw_item.get("row_header"))
+            if indicator and indicator not in {item_indicator, item_row}:
+                continue
+            if row_label and row_label not in {item_indicator, item_row}:
+                continue
+
+            dimension_blob = canonical_dimension_label(" ".join(
+                str(raw_item.get(key) or "")
+                for key in ("column_header", "context", "statistical_scope")
+            ))
+            if not _structured_scan_header_match(column_terms, dimension_blob):
+                continue
+
+            if institution:
+                institution_blob = canonical_dimension_label(" ".join(
+                    str(raw_item.get(key) or "")
+                    for key in ("institution", "column_header", "row_header", "context")
+                ))
+                if institution not in institution_blob:
+                    continue
+
+            if region:
+                region_blob = canonical_dimension_label(" ".join(
+                    str(raw_item.get(key) or "")
+                    for key in ("region", "row_header", "column_header", "context")
+                ))
+                if region not in region_blob:
+                    continue
+
+            # If the plan supplied an actual period coordinate, enforce it.
+            if requested_year or requested_quarter or requested_month:
+                period_match, inferred_period = _structured_item_period_match(
+                    raw_item,
+                    requested_year=requested_year,
+                    requested_quarter=requested_quarter,
+                    requested_month=requested_month,
+                    quarter_anchors=quarter_anchors,
+                    month_anchors=month_anchors,
+                    documents=self.doc_by_id,
+                )
+                if not period_match:
+                    continue
+            else:
+                inferred_period = None
+
+            item = dict(raw_item)
+            if inferred_period:
+                item["_inferred_period"] = inferred_period
+            item["_structured_collection_scan"] = True
+
+            # Structured scan owns recall; scores are only for deterministic
+            # display ordering. Selection itself happens in RetrievalTools.
+            score = 30.0 + float(len(column_terms) * 5)
+            selected.append(Hit(
+                "table",
+                item,
+                lexical_score=0.0,
+                dense_score=0.0,
+                metadata_score=self._metadata(item, query, filters) if filters else 0.0,
+                table_score=score,
+            ))
+
+        if not selected:
+            return None
+
+        # Never compare unlike units when the parser exposes them. This matters
+        # for merged rows: an annual return (%) may physically occupy column B
+        # under a "账面余额" header although it is not a monetary balance.
+        selected = _dominant_comparable_unit(selected)
+        if not selected:
+            return None
+
+        # Collection operations need the complete set, not top_k. Keep a hard
+        # safety cap so malformed giant workbooks cannot explode one request.
+        if len(selected) > 5000:
+            return None
+
+        selected.sort(
+            key=lambda hit: (
+                normalize_text(hit.item.get("row_header") or hit.item.get("indicator")),
+                hit.evidence_id,
+            )
+        )
+        return selected
+
+
     def _search_tables_structured_exact(
         self,
         query: str,
@@ -1173,21 +1404,72 @@ class HybridIndex:
         normalized_row_target = _canonical_label(row_target)
         normalized_dimension = canonical_dimension_label(dimension_target)
         selected: list[Hit] = []
+        print("\n" + "=" * 100)
+        print("[STRUCTURED EXACT DEBUG]")
+        print("row_target =", repr(row_target))
+        print("normalized_row_target =", repr(normalized_row_target))
+        print("dimension_target =", repr(dimension_target))
+        print("normalized_dimension =", repr(normalized_dimension))
+        print("requested_year =", requested_year)
+        print("requested_quarter =", requested_quarter)
+        print("requested_month =", requested_month)
+        print("source_rows =", len(items))
+        print("=" * 100)
 
         for raw_item in items:
+            raw_indicator = raw_item.get("indicator")
+            raw_row = raw_item.get("row_header")
+            raw_column = raw_item.get("column_header")
+
+            # 只打印与“流动性覆盖率”可能有关的行，避免刷屏
+            debug_blob = normalize_text(
+                " ".join(
+                    str(raw_item.get(k) or "")
+                    for k in (
+                        "indicator",
+                        "row_header",
+                        "column_header",
+                        "context",
+                    )
+                )
+            )
+
+            is_debug_target = "流动性覆盖率" in debug_blob
             # Table lookup tasks in this fast path are scalar-cell lookups.
             if normalized_number(raw_item.get("value_text")) is None:
                 continue
 
             item_indicator = _canonical_label(raw_item.get("indicator"))
             item_row = _canonical_label(raw_item.get("row_header"))
-            if normalized_row_target not in {item_indicator, item_row}:
+            if is_debug_target:
+                print("\n[EXACT CANDIDATE]")
+                print("evidence_id =", raw_item.get("evidence_id"))
+                print("raw indicator =", repr(raw_indicator))
+                print("canonical indicator =", repr(item_indicator))
+                print("raw row =", repr(raw_row))
+                print("canonical row =", repr(item_row))
+                print("raw column =", repr(raw_column))
+                print("value_text =", repr(raw_item.get("value_text")))
+            row_ok = normalized_row_target in {item_indicator, item_row}
+
+            if is_debug_target:
+                print("row_ok =", row_ok)
+
+            if not row_ok:
                 continue
 
             dimension_blob = canonical_dimension_label(" ".join(
                 str(raw_item.get(key) or "")
                 for key in ("column_header", "row_header", "context")
             ))
+            dimension_ok = normalized_dimension in dimension_blob
+
+            if is_debug_target:
+                print("dimension_blob =", repr(dimension_blob))
+                print("dimension_ok =", dimension_ok)
+
+            if not dimension_ok:
+                continue
             if normalized_dimension not in dimension_blob:
                 continue
 
@@ -1200,6 +1482,10 @@ class HybridIndex:
                 month_anchors=month_anchors,
                 documents=self.doc_by_id,
             )
+            if is_debug_target:
+                print("period_match =", period_match)
+                print("inferred_period =", inferred_period)
+                print("-" * 80)
             if not period_match:
                 continue
 
@@ -1281,6 +1567,11 @@ class HybridIndex:
         if self._table_provider is None:
             return [dict(item) for item in self.tables]
         doc_ids = self._matching_doc_ids(filters)
+        print("\n" + "=" * 100)
+        print("[TABLE DEBUG]")
+        print("query =", query)
+        print("filters =", filters)
+        print("doc_ids =", doc_ids)
         if not doc_ids:
             return []
         structured = structured or {}
@@ -1296,6 +1587,12 @@ class HybridIndex:
         )
 
         periods = _table_period_candidates(query, structured)
+        print("[TABLE DEBUG] structured =", structured)
+        print("[TABLE DEBUG] indicator =", repr(indicator))
+        print("[TABLE DEBUG] parsed_row =", repr(parsed_row))
+        print("[TABLE DEBUG] row_label =", repr(row_label))
+        print("[TABLE DEBUG] periods =", repr(periods))
+        print("=" * 100)
         collected: dict[str, dict[str, Any]] = {}
 
         def fetch(**kwargs: Any) -> None:
@@ -1513,8 +1810,18 @@ class HybridIndex:
 
 
 def _canonical_label(value: Any) -> str:
-    """Normalize labels whose Excel cells contain layout decoration."""
-    return canonical_table_label(value)
+    text = canonical_table_label(value)
+
+    # 清理 Excel 指标名称中的脚注标记：
+    # 流动性覆盖率**
+    # 流动性覆盖率*
+    # 流动性覆盖率①
+    # 流动性覆盖率注1
+    text = re.sub(r"[*＊※]+$", "", text)
+    text = re.sub(r"[①②③④⑤⑥⑦⑧⑨⑩]+$", "", text)
+    text = re.sub(r"(?:注|备注)\s*\d*$", "", text)
+
+    return text.strip()
 
 
 def _metadata_key(value: Any) -> str:

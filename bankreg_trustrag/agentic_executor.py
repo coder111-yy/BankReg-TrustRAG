@@ -6,17 +6,15 @@ from typing import Any, Callable
 
 from .answer_generator import AnswerGenerationOutcome, AnswerGenerator
 from .calculator import CalculationError, Calculator
-from .completeness import CompletenessChecker, CompletenessResult, is_resolved_retrieval_output
-from .query_plan import CalculationResult, CalculationTask, QueryPlan, RetrievalResult, RetrievalTask
-from .query_planner import (
-    PlannerOutcome,
-    QueryPlanner,
-    calculation_task_from_decision,
-    retrieval_task_from_decision,
+from .completeness import (
+    CompletenessChecker,
+    CompletenessResult,
+    is_resolved_retrieval_output,
 )
+from .query_plan import CalculationResult, QueryPlan, RetrievalResult
+from .query_planner import PlannerOutcome, QueryPlanner
 from .retrieval.index import Hit
-from .retrieval_tools import RetrievalExecution, RetrievalTools
-from .utils import normalize_text
+from .retrieval_tools import RetrievalTools
 
 
 Observer = Callable[[str, dict[str, Any]], None]
@@ -32,37 +30,24 @@ class AgentState:
     retrieval_results: dict[str, RetrievalResult] = field(default_factory=dict)
     calculation_results: dict[str, CalculationResult] = field(default_factory=dict)
     resolved_outputs: dict[str, RetrievalResult | CalculationResult] = field(default_factory=dict)
-    dynamic_retrieval_tasks: list[RetrievalTask] = field(default_factory=list)
-    dynamic_calculation_tasks: list[CalculationTask] = field(default_factory=list)
     hits: list[Hit] = field(default_factory=list)
-    tool_history: list[dict[str, Any]] = field(default_factory=list)
-    iterations: int = 0
     unresolved_requirements: list[str] = field(default_factory=list)
     clarification: dict[str, Any] | None = None
-    refusal_reason: str | None = None
     execution_error: dict[str, Any] | None = None
     answer_outcome: AnswerGenerationOutcome | None = None
     completeness: CompletenessResult | None = None
     final_answer: str | None = None
     latency: dict[str, int] = field(default_factory=dict)
-    termination_reason: str | None = None
 
     def trace(self) -> dict[str, Any]:
         plan = self.query_plan
         return {
             "plan": plan.model_dump() if plan else None,
             "retrieval_tasks": [item.model_dump() for item in (plan.retrieval_tasks if plan else [])],
-            "dynamic_retrieval_tasks": [item.model_dump() for item in self.dynamic_retrieval_tasks],
             "retrieval_results": [item.model_dump() for item in self.retrieval_results.values()],
-            "calculation_tasks": [item.model_dump() for item in (plan.operations if plan else [])],
-            "dynamic_calculation_tasks": [item.model_dump() for item in self.dynamic_calculation_tasks],
             "calculation_results": [item.model_dump() for item in self.calculation_results.values()],
-            "tool_history": list(self.tool_history),
-            "iterations": self.iterations,
             "clarification": self.clarification,
-            "refusal_reason": self.refusal_reason,
             "execution_error": self.execution_error,
-            "termination_reason": self.termination_reason,
             "resolved_output_count": len(self.resolved_outputs),
             "answer_requirements": [item.model_dump() for item in (plan.answer_requirements if plan else [])],
             "answered_requirements": (
@@ -90,13 +75,7 @@ class AgentState:
 
 
 class BoundedAgentExecutor:
-    """Adaptive Plan -> Act -> Observe -> Replan agent loop.
-
-    The initial QueryPlan is only a starting hypothesis. Real retrieval results
-    are fed back to the planner, which chooses one next action at a time. A
-    failed first search therefore causes another search strategy rather than an
-    immediate "insufficient evidence" refusal.
-    """
+    """Explicit state machine with bounded answer regeneration."""
 
     def __init__(
         self,
@@ -115,6 +94,9 @@ class BoundedAgentExecutor:
         self.answer_generator = answer_generator
         self.completeness_checker = completeness_checker or CompletenessChecker()
         self.max_answer_attempts = max(1, min(int(max_answer_attempts), 3))
+        # Keep compatibility with TrustRAGService, which passes agentic_max_steps.
+        # The current executor remains bounded by its existing state-machine logic;
+        # storing this value also preserves the public constructor contract.
         self.max_steps = max(2, min(int(max_steps), 12))
 
     def run(
@@ -125,7 +107,7 @@ class BoundedAgentExecutor:
     ) -> AgentState:
         state = AgentState(question)
         planning_started = time.perf_counter()
-        _report(observer, "planning", label="正在理解问题并形成初始检索计划")
+        _report(observer, "planning", label="正在理解问题并拆解待回答任务")
         planner_outcome: PlannerOutcome = self.planner.plan(question, conversation_context)
         state.latency["planning_ms"] = _elapsed(planning_started)
         state.query_plan = planner_outcome.plan
@@ -133,263 +115,83 @@ class BoundedAgentExecutor:
         state.planner_error = planner_outcome.error
         state.planner_diagnostics = planner_outcome.diagnostics
         plan = planner_outcome.plan
-
-        if planner_outcome.status != "ok":
-            # Initial structured planning is not a single point of failure.
-            # Continue from the recovery seed plan and let next_action choose
-            # search/calculate/clarify based on observations.
-            state.planner_status = "degraded"
-            state.tool_history.append({
-                "step": 0,
-                "source": "planner",
-                "action": "recover",
-                "status": planner_outcome.status,
-                "summary": "初始查询规划失败，切换为自适应检索恢复模式",
-                "error": planner_outcome.error,
-            })
-            _report(observer, "planner_recovery", label="初始规划未成功，正在切换自适应检索继续处理")
-        elif plan.requires_clarification:
+        if planner_outcome.status != "ok" or plan.requires_clarification:
             state.clarification = {
                 "stage": "planning",
-                "reason": plan.clarification_reason or "问题缺少完成任务所需的信息",
-                "question": plan.clarification_reason or "请补充需要比较的具体选项或范围。",
+                "reason": plan.clarification_reason or planner_outcome.error or "问题信息不足",
             }
-            state.termination_reason = "clarification_required"
+            state.unresolved_requirements = [item.id for item in plan.answer_requirements]
             return state
 
-        # Execute the initial plan as seed actions. Unlike the old executor,
-        # failure here is only an observation; it never directly causes refusal.
         retrieval_started = time.perf_counter()
-        _report(
-            observer,
-            "tasks_planned",
-            label=f"已形成初始计划：{len(plan.retrieval_tasks)}个检索任务、{len(plan.operations)}个计算任务",
-        )
+        _report(observer, "tasks_planned", label=f"识别到{len(plan.answer_requirements)}个待回答问题、{len(plan.retrieval_tasks)}个检索任务")
         seen_hits: dict[str, Hit] = {}
-        for task in plan.retrieval_tasks:
-            self._execute_retrieval(state, task, seen_hits, observer, source="initial")
-        state.hits = list(seen_hits.values())
-
-        # Generic recovery: if an initial task returned no evidence, retry that
-        # same information need once with broad retrieval before asking the LLM
-        # to invent a new search. This is especially important for multi-file
-        # questions: the missing second source is retried directly instead of
-        # repeatedly searching an already-resolved first source.
-        for task in plan.retrieval_tasks:
-            current = state.retrieval_results.get(task.id)
-            if current is None or current.status != "not_found":
-                continue
-            broad_task = task.model_copy(update={"search_mode": "broad"})
-            _report(
-                observer,
-                "agent_replan",
-                label=f"初次未找到，正在扩大检索：{task.expected_information}",
-            )
-            self._execute_retrieval(
-                state,
-                broad_task,
-                seen_hits,
-                observer,
-                source="initial_broad_retry",
-            )
-
+        pending_retrievals = list(plan.retrieval_tasks)
+        while pending_retrievals:
+            progressed = False
+            for task in list(pending_retrievals):
+                if any(ref not in state.retrieval_results for ref in task.dependencies):
+                    continue
+                blocked = [
+                    ref for ref in task.dependencies
+                    if state.retrieval_results[ref].status != "resolved"
+                ]
+                if blocked:
+                    result = RetrievalResult(
+                        task_id=task.id,
+                        status="blocked",
+                        expected_information=task.expected_information,
+                        ambiguity_reason=f"前置任务未完成：{', '.join(blocked)}",
+                    )
+                    state.retrieval_results[task.id] = result
+                else:
+                    _report(observer, "retrieving_task", label=f"正在检索：{task.expected_information}")
+                    execution = self.retrieval_tools.execute(task)
+                    if _should_retry_as_text_evidence(plan, task.id, execution.result):
+                        # A threshold or enumerated rule may be described in a
+                        # Word/PDF paragraph even when the task's expected
+                        # answer is numeric. Retry once as text evidence, keep
+                        # the original QueryPlan ID, and never substitute
+                        # evidence obtained for another task.
+                        execution = self.retrieval_tools.execute(_text_evidence_task(task))
+                    result = _bind_retrieval_result(task.id, execution.result, execution.hits)
+                    state.retrieval_results[task.id] = result
+                    if is_resolved_retrieval_output(result):
+                        state.resolved_outputs[task.id] = result
+                    for hit in execution.hits:
+                        seen_hits[hit.evidence_id] = hit
+                pending_retrievals.remove(task)
+                progressed = True
+            if not progressed:
+                # QueryPlan validation normally makes this unreachable. Keep a
+                # bounded executor-side guard for plans built outside Pydantic.
+                for task in pending_retrievals:
+                    state.retrieval_results[task.id] = RetrievalResult(
+                        task_id=task.id,
+                        status="blocked",
+                        expected_information=task.expected_information,
+                        ambiguity_reason="检索任务依赖无法解析",
+                    )
+                break
         state.hits = list(seen_hits.values())
         state.latency["retrieval_ms"] = _elapsed(retrieval_started)
+        _report(observer, "retrieval_complete", label=f"已完成{len(plan.retrieval_tasks)}个检索任务并取得{len(state.hits)}条证据")
 
-        calculation_started = time.perf_counter()
-        self._execute_ready_calculations(state, plan.operations, observer, source="initial")
-        state.latency["calculation_ms"] = _elapsed(calculation_started)
-
-        initial_completeness = self.completeness_checker.check_outputs(
-            plan,
-            state.retrieval_results,
-            state.calculation_results,
-            state.resolved_outputs,
-        )
-        if initial_completeness.complete and self._generate_answer(
-            state, plan, question, observer
-        ):
-            state.termination_reason = "answered_from_initial_plan"
+        ambiguous = [item for item in state.retrieval_results.values() if item.status == "ambiguous"]
+        if ambiguous:
+            state.clarification = {
+                "stage": "retrieval",
+                "reason": "；".join(item.ambiguity_reason or item.expected_information for item in ambiguous),
+                "task_ids": [item.task_id for item in ambiguous],
+            }
+            state.unresolved_requirements = _requirements_using(plan, {item.task_id for item in ambiguous})
             return state
 
-        loop_started = time.perf_counter()
-        seen_action_signatures: dict[str, int] = {
-            _task_signature(task): 1
-            for task in plan.retrieval_tasks
-        }
-        dynamic_search_index = 0
-        dynamic_calc_index = 0
-
-        for step in range(1, self.max_steps + 1):
-            state.iterations = step
-            _report(observer, "agent_observe", label="正在判断当前证据是否足以回答")
-            decision_outcome = self.planner.next_action(
-                question,
-                plan,
-                state.retrieval_results,
-                state.calculation_results,
-                state.tool_history,
-                conversation_context,
-            )
-            if decision_outcome.status != "ok" or decision_outcome.decision is None:
-                # If the decision call fails but we already have evidence, try a
-                # grounded answer once. This avoids converting a transient
-                # planner-format failure into a false evidence refusal.
-                if state.hits and self._generate_answer(state, plan, question, observer):
-                    state.termination_reason = "answer_after_step_failure"
-                    break
-                state.execution_error = {
-                    "stage": "adaptive_planning",
-                    "reason": decision_outcome.error or "智能体下一步决策失败",
-                }
-                state.termination_reason = "adaptive_planner_failed"
-                break
-
-            decision = decision_outcome.decision
-            signature = _decision_signature(decision)
-            seen_action_signatures[signature] = seen_action_signatures.get(signature, 0) + 1
-            if seen_action_signatures[signature] > 1 and decision.action in {"search", "calculate"}:
-                state.tool_history.append({
-                    "step": step,
-                    "action": decision.action,
-                    "status": "skipped_duplicate",
-                    "summary": "检测到重复动作，要求下一轮更换检索/计算策略",
-                    "signature": signature,
-                })
-                _report(observer, "agent_replan", label="检测到重复动作，正在更换检索策略")
-                continue
-
-            if decision.action == "search":
-                dynamic_search_index += 1
-                task_id = f"agent_r{dynamic_search_index}"
-                task = retrieval_task_from_decision(
-                    question,
-                    decision,
-                    task_id,
-                    fallback_source_hint=_single_document_hint(plan),
-                )
-                state.dynamic_retrieval_tasks.append(task)
-                _report(observer, "agent_replan", label=decision.summary)
-                self._execute_retrieval(state, task, seen_hits, observer, source="adaptive", step=step)
-                state.hits = list(seen_hits.values())
-                # A new retrieval may make an initial calculation executable.
-                self._execute_ready_calculations(state, plan.operations, observer, source="initial_retry")
-                continue
-
-            if decision.action == "calculate":
-                dynamic_calc_index += 1
-                task = calculation_task_from_decision(decision, f"agent_op{dynamic_calc_index}")
-                state.dynamic_calculation_tasks.append(task)
-                _report(observer, "calculating", label=decision.summary)
-                try:
-                    result = self.calculator.execute(
-                        task,
-                        state.retrieval_results,
-                        state.calculation_results,
-                    )
-                except CalculationError as exc:
-                    state.tool_history.append({
-                        "step": step,
-                        "action": "calculate",
-                        "status": "failed",
-                        "summary": decision.summary,
-                        "error": str(exc),
-                        "input_refs": task.input_refs(),
-                    })
-                    continue
-                state.calculation_results[result.id] = result
-                state.resolved_outputs[result.id] = result
-                state.tool_history.append({
-                    "step": step,
-                    "action": "calculate",
-                    "status": "resolved",
-                    "summary": decision.summary,
-                    "result_id": result.id,
-                    "result": result.result,
-                    "unit": result.unit,
-                    "trace": result.trace,
-                })
-                continue
-
-            if decision.action == "answer":
-                if self._generate_answer(state, plan, question, observer):
-                    state.termination_reason = "answered"
-                    break
-                state.tool_history.append({
-                    "step": step,
-                    "action": "answer",
-                    "status": "incomplete",
-                    "summary": "回答草稿未覆盖全部用户要求，继续补充证据或重新组织回答",
-                    "missing_requirement_ids": list(state.completeness.missing_requirement_ids) if state.completeness else [],
-                })
-                continue
-
-            if decision.action == "clarify":
-                state.clarification = {
-                    "stage": "adaptive_agent",
-                    "reason": decision.summary,
-                    "question": decision.clarification_question,
-                }
-                state.termination_reason = "clarification_required"
-                break
-
-            if decision.action == "stop":
-                state.refusal_reason = decision.summary or "多轮检索后仍未找到足以支持答案的证据"
-                state.termination_reason = "insufficient_evidence"
-                break
-
-        state.latency["agent_loop_ms"] = _elapsed(loop_started)
-        if state.final_answer is None and state.clarification is None and state.execution_error is None and state.refusal_reason is None:
-            state.refusal_reason = "已尝试多轮不同检索策略，但当前资料仍不足以支持可靠回答"
-            state.termination_reason = "max_steps_insufficient_evidence"
-        return state
-
-    def _execute_retrieval(
-        self,
-        state: AgentState,
-        task: RetrievalTask,
-        seen_hits: dict[str, Hit],
-        observer: Observer | None,
-        *,
-        source: str,
-        step: int | None = None,
-    ) -> None:
-        _report(observer, "retrieving_task", label=f"正在检索：{task.expected_information}")
-        started = time.perf_counter()
-        execution: RetrievalExecution = self.retrieval_tools.execute(task)
-        result = _bind_retrieval_result(task.id, execution.result, execution.hits)
-        state.retrieval_results[task.id] = result
-        if is_resolved_retrieval_output(result):
-            state.resolved_outputs[task.id] = result
-        for hit in execution.hits:
-            seen_hits[hit.evidence_id] = hit
-        state.tool_history.append({
-            "step": step,
-            "source": source,
-            "action": "search",
-            "task_id": task.id,
-            "query": task.query,
-            "expected_information": task.expected_information,
-            "search_mode": task.search_mode,
-            "status": result.status,
-            "ambiguity_reason": result.ambiguity_reason,
-            "evidence_count": len(result.evidence_ids),
-            "selected": _selected_summary(result),
-            "diagnostics": execution.diagnostics,
-            "latency_ms": _elapsed(started),
-        })
-
-    def _execute_ready_calculations(
-        self,
-        state: AgentState,
-        operations: list[CalculationTask],
-        observer: Observer | None,
-        *,
-        source: str,
-    ) -> None:
-        pending = [op for op in operations if op.output_id not in state.calculation_results]
-        progressed = True
-        while pending and progressed:
+        calculation_started = time.perf_counter()
+        if plan.operations:
+            _report(observer, "calculating", label=f"正在执行{len(plan.operations)}项确定性计算")
+        pending = list(plan.operations)
+        while pending:
             progressed = False
             for operation in list(pending):
                 try:
@@ -402,32 +204,32 @@ class BoundedAgentExecutor:
                     continue
                 state.calculation_results[result.id] = result
                 state.resolved_outputs[result.id] = result
-                state.tool_history.append({
-                    "source": source,
-                    "action": "calculate",
-                    "status": "resolved",
-                    "operation_id": operation.id,
-                    "result_id": result.id,
-                    "result": result.result,
-                    "unit": result.unit,
-                    "trace": result.trace,
-                })
                 pending.remove(operation)
                 progressed = True
-                _report(observer, "calculating", label=f"已完成计算：{result.trace}")
+            if not progressed:
+                break
+        state.latency["calculation_ms"] = _elapsed(calculation_started)
 
-    def _generate_answer(
-        self,
-        state: AgentState,
-        plan: QueryPlan,
-        question: str,
-        observer: Observer | None,
-    ) -> bool:
+        output_check = self.completeness_checker.check_outputs(
+            plan,
+            state.retrieval_results,
+            state.calculation_results,
+            state.resolved_outputs,
+        )
+        state.completeness = output_check
+        if not output_check.complete:
+            state.unresolved_requirements = list(output_check.missing_requirement_ids)
+            state.execution_error = {
+                "stage": "output_binding",
+                "reason": "已完成执行，但部分结果未能绑定到回答要求",
+                "missing_output_count": len(output_check.missing_outputs),
+            }
+            return state
+
         generation_started = time.perf_counter()
-        available_refs = set(state.retrieval_results) | set(state.calculation_results)
         missing_requirement_ids: list[str] = []
         for _ in range(self.max_answer_attempts):
-            _report(observer, "generating", label="正在根据当前证据生成回答")
+            _report(observer, "generating", label="正在根据证据与计算结果生成完整回答")
             outcome = self.answer_generator.generate(
                 question,
                 plan,
@@ -436,34 +238,41 @@ class BoundedAgentExecutor:
                 missing_requirement_ids=missing_requirement_ids,
             )
             state.answer_outcome = outcome
-            if outcome.status != "ok":
-                state.completeness = CompletenessResult(
-                    False,
-                    missing_requirement_ids=tuple(item.id for item in plan.answer_requirements),
-                    reasons=("回答模型暂时不可用",),
-                )
-                break
-            answer_check = self.completeness_checker.check_answer(
-                plan,
-                outcome.generated,
-                available_refs=available_refs,
-                strict_required_outputs=False,
-            )
+            answer_check = self.completeness_checker.check_answer(plan, outcome.generated)
             state.completeness = answer_check
             if answer_check.complete:
                 state.final_answer = outcome.generated.answer
-                state.latency["generation_ms"] = state.latency.get("generation_ms", 0) + _elapsed(generation_started)
-                return True
+                break
             missing_requirement_ids = list(answer_check.missing_requirement_ids)
-        state.latency["generation_ms"] = state.latency.get("generation_ms", 0) + _elapsed(generation_started)
-        state.unresolved_requirements = missing_requirement_ids
-        return False
+        state.latency["generation_ms"] = _elapsed(generation_started)
+        if state.final_answer is None:
+            state.unresolved_requirements = missing_requirement_ids
+            state.execution_error = {
+                "stage": "answer_completeness",
+                "reason": "最终回答未覆盖全部用户要求",
+                "missing_requirement_count": len(missing_requirement_ids),
+            }
+        return state
 
 
-
-def _single_document_hint(plan: QueryPlan) -> str | None:
-    documents = [item for item in plan.entities.documents if item]
-    return documents[0] if len(documents) == 1 else None
+def _requirements_using(plan: QueryPlan, missing_refs: set[str]) -> list[str]:
+    affected = {
+        operation.output_id
+        for operation in plan.operations
+        if missing_refs.intersection(operation.input_refs())
+    } | missing_refs
+    changed = True
+    while changed:
+        changed = False
+        for operation in plan.operations:
+            if affected.intersection(operation.input_refs()) and operation.output_id not in affected:
+                affected.add(operation.output_id)
+                changed = True
+    return [
+        requirement.id
+        for requirement in plan.answer_requirements
+        if affected.intersection(requirement.required_outputs)
+    ]
 
 
 def _report(observer: Observer | None, stage: str, **details: Any) -> None:
@@ -480,6 +289,7 @@ def _bind_retrieval_result(
     result: RetrievalResult,
     hits: list[Hit],
 ) -> RetrievalResult:
+    """Normalize tool output into the executor's unified output registry."""
     evidence_ids = list(dict.fromkeys([
         *result.evidence_ids,
         *(hit.evidence_id for hit in hits),
@@ -492,67 +302,33 @@ def _bind_retrieval_result(
     return result.model_copy(update=updates) if updates else result
 
 
-def _decision_signature(decision: Any) -> str:
-    if decision.action == "search":
-        return "|".join([
-            "search",
-            normalize_text(decision.query),
-            normalize_text(decision.source_hint),
-            normalize_text(decision.indicator),
-            normalize_text(decision.period),
-            normalize_text(decision.row_label),
-            normalize_text(decision.column_label),
-            str(decision.search_mode),
-            str(getattr(decision, "selection", "single")),
-            ",".join(sorted(
-                normalize_text(value)
-                for value in (getattr(decision, "exclude_row_labels", []) or [])
-                if normalize_text(value)
-            )),
-        ])
-    if decision.action == "calculate":
-        return "|".join([
-            "calculate",
-            str(decision.operation_type),
-            str(decision.output_id),
-            ",".join(decision.calculation_input_refs()),
-        ])
-    return f"{decision.action}|{normalize_text(decision.summary)}"
+def _should_retry_as_text_evidence(
+    plan: QueryPlan,
+    task_id: str,
+    result: RetrievalResult,
+) -> bool:
+    if result.status != "not_found" or result.evidence_ids:
+        return False
+    directly_required = any(
+        task_id in requirement.required_outputs
+        for requirement in plan.answer_requirements
+    )
+    calculation_input = any(
+        task_id in operation.input_refs()
+        for operation in plan.operations
+    )
+    return directly_required and not calculation_input
 
 
-def _task_signature(task: RetrievalTask) -> str:
-    semantic = task.semantic_constraints
-    return "|".join([
-        "search",
-        normalize_text(task.query),
-        normalize_text(task.source_scope.document_title),
-        normalize_text(semantic.indicator),
-        normalize_text(semantic.period),
-        normalize_text(semantic.row_label),
-        normalize_text(semantic.column_label),
-        str(task.search_mode),
-        str(getattr(task, "selection", "single")),
-        ",".join(sorted(
-            normalize_text(value)
-            for value in (getattr(task, "exclude_row_labels", []) or [])
-            if normalize_text(value)
-        )),
-    ])
-
-
-def _selected_summary(result: RetrievalResult) -> dict[str, Any] | None:
-    selected = result.selected
-    if selected is None:
-        return None
-    value = selected.value
-    if isinstance(value, str) and len(value) > 500:
-        value = value[:500] + "…"
-    return {
-        "value": value,
-        "unit": selected.unit,
-        "document_title": selected.document_title,
-        "sheet_name": selected.sheet_name,
-        "cell_address": selected.cell_address,
-        "period": selected.period,
-        "evidence_ids": list(selected.evidence_ids),
-    }
+def _text_evidence_task(task: Any) -> Any:
+    constraints = task.semantic_constraints.model_copy(update={
+        "indicator": None,
+        "parent_indicator": None,
+        "row_label": None,
+        "column_label": None,
+    })
+    return task.model_copy(update={
+        "expected_value_type": "text",
+        "expected_unit": None,
+        "semantic_constraints": constraints,
+    })

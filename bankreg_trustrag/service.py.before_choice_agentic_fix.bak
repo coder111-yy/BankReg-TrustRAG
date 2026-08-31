@@ -30,7 +30,7 @@ from .retrieval_tools import RetrievalTools
 from .schemas import QAResponse
 from .storage import Store
 from .utils import char_ngrams, normalize_text
-from .verification import trust_decision, verify_claims, verify_evidence_guard
+from .verification import trust_decision, verify_claims
 
 
 logger = logging.getLogger("bankreg_trustrag.service")
@@ -89,10 +89,7 @@ class TrustRAGService:
     def _refresh_agentic_executor(self) -> None:
         answer_client = LLMClient.from_settings(self.settings)
         self.agentic_executor = BoundedAgentExecutor(
-            QueryPlanner.from_settings(
-                self.settings,
-                document_catalog=getattr(self.index, "documents", []),
-            ),
+            QueryPlanner.from_settings(self.settings),
             RetrievalTools(self.index, max(self.settings.top_k, 12)),
             Calculator(),
             AnswerGenerator.from_settings(self.settings, answer_client),
@@ -181,16 +178,12 @@ class TrustRAGService:
         if hasattr(self.index, "begin_query"):
             self.index.begin_query()
         _, inline_choices = extract_inline_choices(question)
-        effective_choices = valid_choices(choices or inline_choices)
-        # Multiple-choice is an answer format, not a retrieval route. When the
-        # LLM planner is enabled, every question is planned first; the legacy
-        # Choice Agent remains only as a fallback when the planner is disabled.
-        if bool(getattr(self.settings, "agentic_planner_enabled", False)):
+        has_choices = bool(valid_choices(choices or inline_choices))
+        if bool(getattr(self.settings, "agentic_planner_enabled", False)) and not has_choices:
             response = self._ask_agentic(
                 question,
                 conversation_context,
                 observer,
-                choices=effective_choices,
                 request_started=request_started,
             )
             if response is not None:
@@ -211,7 +204,6 @@ class TrustRAGService:
         conversation_context: list[dict[str, Any]] | None,
         observer: Callable[[str, dict[str, Any]], None] | None,
         *,
-        choices: list[str] | None = None,
         request_started: float | None = None,
     ) -> QAResponse | None:
         started = request_started if request_started is not None else time.perf_counter()
@@ -220,82 +212,12 @@ class TrustRAGService:
             if observer is not None:
                 observer(stage, {"elapsed_ms": int((time.perf_counter() - started) * 1000), **details})
 
-        # If choices came through the API as a separate array, expose them to
-        # Planner/Answer Agent. They are candidates only, never evidence.
-        # Inline A/B/C/D questions are left unchanged.
-        agentic_question = _agentic_question_with_choices(question, choices)
-
         executor = getattr(self, "agentic_executor", None)
         if executor is None:
             if str(getattr(self.settings, "agentic_planner_failure_mode", "legacy")) == "legacy":
                 return None
             raise RuntimeError("agentic executor is not initialized")
-        state: AgentState = executor.run(agentic_question, conversation_context, report)
-
-        # ------------------------------------------------------------------
-        # DEBUG: print the actual evidence retrieved by the Agentic pipeline.
-        # This is intentionally placed immediately after executor.run(), so it
-        # shows retrieval results before answer generation / verification can
-        # change the final presentation. Remove this block after debugging.
-        # ------------------------------------------------------------------
-        print("\n" + "=" * 100, flush=True)
-        print("【DEBUG】本轮 Agentic 检索结果", flush=True)
-        print(f"question: {question}", flush=True)
-        print(f"agentic_question: {agentic_question}", flush=True)
-        print(f"planner_status: {state.planner_status}", flush=True)
-        print("=" * 100, flush=True)
-
-        print("\n【1】RetrievalTask / RetrievalResult", flush=True)
-        if not state.retrieval_results:
-            print("  (没有 retrieval_results)", flush=True)
-        for task_id, result in state.retrieval_results.items():
-            print("\n" + "-" * 100, flush=True)
-            print(f">>> Task: {task_id}", flush=True)
-            print(f"status: {getattr(result, 'status', None)}", flush=True)
-            print(f"expected_information: {getattr(result, 'expected_information', None)}", flush=True)
-
-            selected = getattr(result, "selected", None)
-            if selected is not None:
-                try:
-                    selected_data = selected.model_dump()
-                except Exception:
-                    selected_data = selected
-                print("SELECTED:", flush=True)
-                print(selected_data, flush=True)
-            else:
-                print("SELECTED: None", flush=True)
-
-            candidates = list(getattr(result, "candidates", None) or [])
-            print(f"CANDIDATES: {len(candidates)}", flush=True)
-            for idx, candidate in enumerate(candidates, 1):
-                try:
-                    candidate_data = candidate.model_dump()
-                except Exception:
-                    candidate_data = candidate
-                print(f"  [{idx}] {candidate_data}", flush=True)
-
-        print("\n【2】state.hits：真正汇总进入后续生成/核验的全部证据", flush=True)
-        print(f"hit_count: {len(state.hits)}", flush=True)
-        for idx, hit in enumerate(state.hits, 1):
-            item = getattr(hit, "item", {}) or {}
-            content = str(item.get("content") or item.get("context_window") or item.get("context") or "")
-            if len(content) > 1200:
-                content = content[:1200] + " ...[truncated]"
-            print("\n" + "-" * 100, flush=True)
-            print(f"[{idx}] evidence_id={getattr(hit, 'evidence_id', None)}", flush=True)
-            print(f"kind={getattr(hit, 'kind', None)}", flush=True)
-            print(f"fused_score={getattr(hit, 'fused_score', None)}", flush=True)
-            print(f"doc_id={item.get('doc_id')}", flush=True)
-            print(f"source_title={item.get('source_title')}", flush=True)
-            print(f"source_file_name={item.get('source_file_name')}", flush=True)
-            print(f"page={item.get('page')} section={item.get('section')} article_no={item.get('article_no')}", flush=True)
-            print(f"sheet_name={item.get('sheet_name')} cell_address={item.get('cell_address')}", flush=True)
-            print(f"indicator={item.get('indicator')} period={item.get('period')} value={item.get('value')}", flush=True)
-            print(f"content/context={content}", flush=True)
-
-        print("\n" + "=" * 100, flush=True)
-        print("【DEBUG】检索结果输出结束", flush=True)
-        print("=" * 100 + "\n", flush=True)
+        state: AgentState = executor.run(question, conversation_context, report)
         failure_mode = str(getattr(self.settings, "agentic_planner_failure_mode", "legacy") or "legacy").lower()
         if state.planner_status == "disabled" and failure_mode == "legacy":
             if observer is not None:
@@ -335,29 +257,72 @@ class TrustRAGService:
             answer = state.final_answer or "当前资料中未检索到足以支持结论的证据，无法可靠回答。"
             claims = split_grounded_claims(answer)
 
-        # Agentic architecture: the LLM is the semantic judge for ALL question types.
-        # Python no longer re-interprets natural-language entailment with string/ngram rules.
-        # It only enforces deterministic provenance and factual constraints.
         verification_started = time.perf_counter()
-        generated = state.answer_outcome.generated if state.answer_outcome is not None else None
-        grounding_refs = _expanded_agentic_grounding_refs(
-            state,
-            generated.output_refs_by_requirement if generated is not None else None,
-        )
-        verification = verify_evidence_guard(
+        verification = verify_claims(
             answer,
             question,
             state.hits,
             claims,
             operations,
             completeness=(None if state.execution_error is not None else state.completeness),
-            grounding_refs=grounding_refs,
-            declared_evidence_ids=(generated.supporting_evidence_ids if generated is not None else None),
-            llm_supported=(bool(generated.supported) if generated is not None else False),
-            need_more_evidence=(bool(generated.need_more_evidence) if generated is not None else True),
+            grounding_refs=(
+                state.answer_outcome.generated.output_refs_by_requirement
+                if state.answer_outcome else None
+            ),
         )
         verification_ms = int((time.perf_counter() - verification_started) * 1000)
         verification_attempts = [verification.to_dict()]
+
+        # A factual verification failure is feedback for the Answer Agent,
+        # not a signal to replace its answer with a Python-authored business
+        # conclusion.  Give the model one bounded repair pass with the exact
+        # failed provenance checks; retrieval and calculation remain frozen.
+        if (
+            state.clarification is None
+            and not verification.passed
+            and state.answer_outcome is not None
+            and state.answer_outcome.status == "ok"
+        ):
+            report("answer_repair", {"label": "正在依据事实核验结果修订回答"})
+            repair_started = time.perf_counter()
+            repaired = executor.answer_generator.generate(
+                question,
+                plan,
+                state.retrieval_results,
+                state.calculation_results,
+                verification_feedback=verification.failure_details,
+            )
+            state.latency["generation_ms"] = (
+                state.latency.get("generation_ms", 0)
+                + int((time.perf_counter() - repair_started) * 1000)
+            )
+            repaired_completeness = executor.completeness_checker.check_answer(
+                plan,
+                repaired.generated,
+                available_refs=set(state.retrieval_results) | set(state.calculation_results),
+                strict_required_outputs=False,
+            )
+            if repaired_completeness.complete:
+                repaired_answer = repaired.generated.answer
+                repaired_claims = split_grounded_claims(repaired_answer)
+                repaired_verification_started = time.perf_counter()
+                repaired_verification = verify_claims(
+                    repaired_answer,
+                    question,
+                    state.hits,
+                    repaired_claims,
+                    operations,
+                    completeness=repaired_completeness,
+                    grounding_refs=repaired.generated.output_refs_by_requirement,
+                )
+                verification_ms += int((time.perf_counter() - repaired_verification_started) * 1000)
+                verification_attempts.append(repaired_verification.to_dict())
+                state.answer_outcome = repaired
+                state.completeness = repaired_completeness
+                state.final_answer = repaired_answer
+                answer = repaired_answer
+                claims = repaired_claims
+                verification = repaired_verification
         state.latency["verification_ms"] = verification_ms
         trust = trust_decision(state.hits, verification, qa_type, self.settings.min_trust, 0.9 if state.final_answer else 0.0)
         if state.clarification is not None:
@@ -375,19 +340,14 @@ class TrustRAGService:
             trust.setdefault("reasons", []).append("本次智能体执行异常，可重试")
         elif not verification.passed:
             trust["decision"] = "clarify"
-            trust.setdefault("reasons", []).append("回答未通过确定性证据守门")
-            # Only deterministic provenance/number/date/unit failures can reach here.
-            # Semantic entailment has already been decided by the LLM.
-            answer = "当前回答包含未由本轮证据或确定性计算支持的事实，无法可靠返回。"
+            trust.setdefault("reasons", []).append("Agentic回答未通过事实核验")
+            # Fail closed after the bounded model repair.  This is a runtime
+            # safety status, never a Python-authored answer to the user's
+            # domain question.
+            answer = "回答草稿包含无法由当前证据或计算结果核验的事实，已停止返回该草稿。请重试。"
 
         trace = state.trace()
         trace["verification"] = verification.to_dict()
-        trace["llm_semantic_decision"] = {
-            "supported": (bool(generated.supported) if generated is not None else False),
-            "need_more_evidence": (bool(generated.need_more_evidence) if generated is not None else True),
-            "supporting_evidence_ids": (list(generated.supporting_evidence_ids) if generated is not None else []),
-            "mode": "llm_semantic_judge_plus_deterministic_guard",
-        }
         trace["verification_attempts"] = verification_attempts
         trace["latency"] = {**trace.get("latency", {}), "verification_ms": verification_ms}
         latency = int((time.perf_counter() - started) * 1000)
@@ -399,13 +359,13 @@ class TrustRAGService:
             "calculation": plan.requires_calculation,
             "comparison": any(item.type in {"compare", "max", "min", "subtract", "growth_rate", "verify_consistency"} for item in plan.operations),
             "multi_hop": bool(plan.operations or len(plan.retrieval_tasks) > 1),
-            "option_evaluation": bool(choices),
+            "option_evaluation": False,
         }
         query_plan = {
             "original_query": question,
             "qa_type": qa_type,
             "intent": plan.user_goal,
-            "answer_format": "multiple_choice" if choices else "free_text",
+            "answer_format": "free_text",
             "requirements": requirements,
             "entities": plan.entities.model_dump(),
             "retrieval_routes": [
@@ -454,7 +414,7 @@ class TrustRAGService:
                     else (
                         "本次智能体执行异常，请重试"
                         if state.execution_error is not None
-                        else "自适应检索与LLM证据判断已完成"
+                        else "自适应检索与证据核验已完成"
                     )
                 )
             )
@@ -1481,65 +1441,6 @@ def _active_retrieval_routes(index: Any) -> list[str]:
         ("structured_table_used", "structured_table"),
     )
     return [label for key, label in mapping if status.get(key)]
-
-
-
-def _agentic_question_with_choices(question: str, choices: list[str] | None) -> str:
-    """Expose API-supplied options to the planner without treating them as evidence."""
-    options = valid_choices(choices or [])
-    if not options:
-        return question
-
-    # Inline options are already part of the HumanMessage. Avoid duplicating
-    # them, because duplicate years/numbers can distort the planner.
-    _, inline = extract_inline_choices(question)
-    if valid_choices(inline):
-        return question
-
-    rendered = "\n".join(
-        f"{chr(ord('A') + index)}. {option}"
-        for index, option in enumerate(options)
-    )
-    return (
-        f"{question.rstrip()}\n\n"
-        "候选选项（仅供最终判断，选项内容不是证据）：\n"
-        f"{rendered}"
-    )
-
-
-
-def _expanded_agentic_grounding_refs(
-    state: AgentState,
-    refs_by_requirement: dict[str, list[str]] | None,
-) -> dict[str, list[str]] | None:
-    """Expand Answer-Agent task/result refs to exact evidence provenance."""
-    if not refs_by_requirement:
-        return None
-    expanded: dict[str, list[str]] = {}
-    for requirement_id, refs in refs_by_requirement.items():
-        values: list[str] = []
-        for raw_ref in refs or []:
-            ref = str(raw_ref)
-            if ref and ref not in values:
-                values.append(ref)
-
-            retrieval = state.retrieval_results.get(ref)
-            if retrieval is not None:
-                for evidence_id in retrieval.evidence_ids:
-                    evidence_id = str(evidence_id)
-                    if evidence_id and evidence_id not in values:
-                        values.append(evidence_id)
-
-            calculation = state.calculation_results.get(ref)
-            if calculation is not None:
-                for evidence_id in getattr(calculation, "evidence_ids", []) or []:
-                    evidence_id = str(evidence_id)
-                    if evidence_id and evidence_id not in values:
-                        values.append(evidence_id)
-
-        if values:
-            expanded[str(requirement_id)] = values
-    return expanded or None
 
 
 def _agentic_qa_type(plan: QueryPlan) -> str:

@@ -5,7 +5,7 @@ import re
 import subprocess
 import shutil
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -29,7 +29,60 @@ class ParseResult:
     table_evidence: list[TableCellEvidence] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
+def _is_percent_format(number_format: Any) -> bool:
+    text = str(number_format or "")
+    return "%" in text or "％" in text
 
+
+def _apply_excel_percent_formats(
+    records: list[TableCellEvidence],
+    percent_cells: set[str],
+) -> list[TableCellEvidence]:
+    """
+    Convert Excel percentage-formatted numeric cells from their stored
+    decimal representation to percentage-point representation.
+
+    Example:
+        Excel stored value: 1.54729
+        Excel display:      154.729%
+        evidence value:     154.729
+        evidence unit:      %
+    """
+    normalized: list[TableCellEvidence] = []
+
+    for record in records:
+        value = record.value
+
+        if (
+            record.cell_address in percent_cells
+            and isinstance(value, (int, float))
+            and not isinstance(value, bool)
+        ):
+            scaled = round(float(value) * 100.0, 12)
+
+            # context 里面最后一个字段也是原始数值，
+            # 必须同步修改，否则后面的 BGE / LLM / Verification
+            # 仍可能看到 1.54729 而不是 154.729。
+            context = normalize_text(record.context)
+
+            if context:
+                parts = [part.strip() for part in context.split("|")]
+                if parts:
+                    parts[-1] = str(scaled)
+                    context = " | ".join(parts)
+
+            # TableCellEvidence 不是 Pydantic model，
+            # 使用 dataclasses.replace 创建修改后的副本。
+            record = replace(
+                record,
+                value=scaled,
+                unit="%",
+                context=context,
+            )
+
+        normalized.append(record)
+
+    return normalized
 def _document_type(path: Path) -> str:
     suffix = path.suffix.lower()
     return {".docx": "word", ".doc": "word", ".pdf": "pdf", ".xlsx": "excel", ".xls": "excel"}.get(suffix, "other")
@@ -781,33 +834,139 @@ def _parse_xls_with_libreoffice(path: Path, doc: Document) -> tuple[list[TableCe
         return [], [f"legacy XLS fallback failed: {type(exc).__name__}: {exc}"]
 
 
-def parse_excel(path: Path, doc: Document) -> tuple[list[TableCellEvidence], list[str]]:
+def parse_excel(
+    path: Path,
+    doc: Document,
+) -> tuple[list[TableCellEvidence], list[str]]:
     warnings: list[str] = []
     records: list[TableCellEvidence] = []
+
     try:
+        # ============================================================
+        # XLSX
+        # ============================================================
         if path.suffix.lower() == ".xlsx":
             import openpyxl
 
-            workbook = openpyxl.load_workbook(path, read_only=True, data_only=True)
+            workbook = openpyxl.load_workbook(
+                path,
+                read_only=True,
+                data_only=True,
+            )
+
             for sheet in workbook.worksheets:
-                rows = [list(row) for row in sheet.iter_rows(values_only=True)]
-                records.extend(_cell_records(doc, sheet.title, rows, sheet.title))
+                rows: list[list[Any]] = []
+                percent_cells: set[str] = set()
+
+                # 不再 values_only=True，
+                # 因为必须保留 number_format。
+                for excel_row in sheet.iter_rows():
+                    values: list[Any] = []
+
+                    for cell in excel_row:
+                        values.append(cell.value)
+
+                        if _is_percent_format(
+                            getattr(cell, "number_format", None)
+                        ):
+                            percent_cells.add(cell.coordinate)
+
+                    rows.append(values)
+
+                sheet_records = _cell_records(
+                    doc,
+                    sheet.title,
+                    rows,
+                    sheet.title,
+                )
+
+                records.extend(
+                    _apply_excel_percent_formats(
+                        sheet_records,
+                        percent_cells,
+                    )
+                )
+
+        # ============================================================
+        # XLS
+        # ============================================================
         else:
-            try:
-                import xlrd
-            except ImportError:
-                fallback_records, fallback_warnings = _parse_xls_with_libreoffice(path, doc)
-                records.extend(fallback_records)
-                warnings.extend(fallback_warnings)
-            else:
-                workbook = xlrd.open_workbook(str(path), on_demand=True)
-                for sheet in workbook.sheets():
-                    rows = [sheet.row_values(i) for i in range(sheet.nrows)]
-                    records.extend(_cell_records(doc, sheet.name, rows, sheet.name))
+            import xlrd
+
+            workbook = xlrd.open_workbook(
+                str(path),
+                on_demand=True,
+                formatting_info=True,
+            )
+
+            for sheet in workbook.sheets():
+                rows: list[list[Any]] = []
+                percent_cells: set[str] = set()
+
+                for row_index in range(sheet.nrows):
+                    values: list[Any] = []
+
+                    for column_index in range(sheet.ncols):
+                        cell = sheet.cell(
+                            row_index,
+                            column_index,
+                        )
+
+                        values.append(cell.value)
+
+                        try:
+                            xf = workbook.xf_list[cell.xf_index]
+                            fmt = workbook.format_map.get(
+                                xf.format_key
+                            )
+                            format_string = (
+                                fmt.format_str
+                                if fmt is not None
+                                else ""
+                            )
+
+                            if _is_percent_format(format_string):
+                                percent_cells.add(
+                                    _excel_address(
+                                        row_index + 1,
+                                        column_index + 1,
+                                    )
+                                )
+                        except (
+                            AttributeError,
+                            IndexError,
+                            KeyError,
+                            TypeError,
+                        ):
+                            pass
+
+                    rows.append(values)
+
+                sheet_records = _cell_records(
+                    doc,
+                    sheet.name,
+                    rows,
+                    sheet.name,
+                )
+
+                records.extend(
+                    _apply_excel_percent_formats(
+                        sheet_records,
+                        percent_cells,
+                    )
+                )
+
     except ImportError as exc:
-        warnings.append(f"missing spreadsheet dependency for {path.suffix}: {exc}")
-    except Exception as exc:  # malformed attachments must be recorded, not abort a corpus build
-        warnings.append(f"spreadsheet parse failed: {type(exc).__name__}: {exc}")
+        warnings.append(
+            f"missing spreadsheet dependency for {path.suffix}: {exc}"
+        )
+
+    except Exception as exc:
+        warnings.append(
+            "spreadsheet parse failed: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
     return records, warnings
 
 

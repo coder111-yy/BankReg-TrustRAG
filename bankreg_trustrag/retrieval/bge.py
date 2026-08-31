@@ -1,11 +1,17 @@
 """Local BGE embedding and reranking components.
 
-The module deliberately imports sentence-transformers lazily.  This keeps the
-deterministic test path usable when the optional ML runtime is not installed,
-while the production path uses the configured BGE models locally.
+The module deliberately imports sentence-transformers lazily.
 """
 
 from __future__ import annotations
+
+import os
+
+# Windows + CPU 环境下，Transformers 并行加载 BGE reranker
+# 可能在 torch storage materialization 阶段触发 0xC0000005。
+# 必须在 transformers / sentence_transformers 被导入前设置。
+os.environ.setdefault("HF_ENABLE_PARALLEL_LOADING", "false")
+os.environ.setdefault("HF_PARALLEL_LOADING_WORKERS", "1")
 
 import hashlib
 import json
